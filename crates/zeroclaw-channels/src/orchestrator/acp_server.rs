@@ -7512,7 +7512,9 @@ mod tests {
             notifications.push(msg);
         }
         assert!(
-            notifications.iter().any(|n| n.contains("carrier-rejected.png")),
+            notifications
+                .iter()
+                .any(|n| n.contains("carrier-rejected.png")),
             "the client must still replay the attachment: {notifications:?}"
         );
 
@@ -7639,10 +7641,9 @@ mod tests {
             live_image.display()
         );
 
-        let live_store = Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(
-            live_cwd.path(),
-        )
-        .unwrap());
+        let live_store = Arc::new(
+            zeroclaw_infra::acp_session_store::AcpSessionStore::new(live_cwd.path()).unwrap(),
+        );
         let live_server = Arc::new(AcpServer::new_with_store(
             make_test_config(live_cwd.path()),
             AcpServerConfig::default(),
@@ -7668,13 +7669,15 @@ mod tests {
                 .get(&live_session)
                 .cloned()
                 .expect("new session must be active");
-            session.lock().await.agent.set_model_provider(Box::new(
-                PromptToolVisionProvider {
+            session
+                .lock()
+                .await
+                .agent
+                .set_model_provider(Box::new(PromptToolVisionProvider {
                     requests: Arc::clone(&live_requests),
                     calls: std::sync::atomic::AtomicUsize::new(0),
                     tool_call_response,
-                },
-            ));
+                }));
         }
 
         // The image-bearing turn runs one prompt-mode tool round, then fails.
@@ -7693,10 +7696,11 @@ mod tests {
             .unwrap()
             .expect("session record exists");
         assert!(
-            stored.messages.iter().any(
-                |m| matches!(m, ConversationMessage::Chat(chat)
-                    if chat.role == "user" && chat.content.starts_with("[Tool results]"))
-            ),
+            stored
+                .messages
+                .iter()
+                .any(|m| matches!(m, ConversationMessage::Chat(chat)
+                    if chat.role == "user" && chat.content.starts_with("[Tool results]"))),
             "precondition: the failed turn must contain a prompt-mode tool-result carrier: {:?}",
             stored.messages
         );
@@ -7725,7 +7729,9 @@ mod tests {
             live_requests.len()
         );
         assert!(
-            live_requests[0].iter().any(|m| m.content.contains("data:image")),
+            live_requests[0]
+                .iter()
+                .any(|m| m.content.contains("data:image")),
             "precondition: the first request carried the image"
         );
         for message in &live_requests[2] {
