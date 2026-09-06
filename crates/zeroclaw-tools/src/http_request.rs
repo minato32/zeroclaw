@@ -1504,6 +1504,106 @@ api_token = "Bearer from-secret"
         );
     }
 
+    fn deflate_stream(payload: &[u8]) -> Vec<u8> {
+        // HTTP `deflate` is zlib-wrapped; the decoder expects the wrapper.
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_deflate_response_fails_the_body_read() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A GET 200 advertising deflate with zero body bytes has no zlib
+        // stream at all. It must fail the body read exactly like the empty
+        // gzip case, not report a successful empty response.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-encoding", "deflate"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            !result.success,
+            "a GET 200 with an empty deflate body must fail: {:?}",
+            result.error
+        );
+        let error = result.error.expect("the body read must report a failure");
+        assert!(
+            error.contains("Failed to read response body"),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_empty_deflate_response_succeeds_with_empty_body() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Positive control: a complete zlib stream that encodes zero bytes is
+        // a legitimate empty body and must keep succeeding — the completion
+        // check may not turn "empty because complete" into a failure.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "deflate")
+                    .set_body_raw(deflate_stream(b""), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        assert!(
+            result.output.as_str().ends_with("Response Body:\n"),
+            "the body must be empty, got {:?}",
+            result.output.as_str()
+        );
+    }
+
     #[test]
     fn extract_host_normalizes_ipv6_without_brackets() {
         let got = extract_host("https://[2001:db8::1]:443/path").unwrap();

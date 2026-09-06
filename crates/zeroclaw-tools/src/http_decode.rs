@@ -92,6 +92,82 @@ impl Write for CappedWriter {
     }
 }
 
+/// The zlib (deflate) variant retains the offered compressed input so ordinary
+/// EOF can prove the stream actually completed. flate2's write-mode
+/// `ZlibDecoder::finish` reports success whenever output stops growing, and
+/// the miniz backend maps "needs more input" at Finish to a success-variant
+/// status, so without this proof a missing or truncated body silently decodes
+/// as an empty or partial success. Gzip (trailer validation) and brotli
+/// (incomplete-stream error) detect this themselves; deflate is the one
+/// advertised coding that cannot.
+struct CompletionTrackedZlib {
+    decoder: Box<flate2::write::ZlibDecoder<CappedWriter>>,
+    /// Every byte offered to the decoder, already clipped to the
+    /// compressed-input allowance by `BoundedDecode::push` — bounded by
+    /// `limit + COMPRESSED_INPUT_SLACK` when limited, and unlimited mode
+    /// already retains the whole decoded body.
+    offered_input: Vec<u8>,
+}
+
+impl CompletionTrackedZlib {
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        self.offered_input.extend_from_slice(data);
+        self.decoder.write_all(data)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.decoder.flush()
+    }
+
+    fn get_ref(&self) -> &CappedWriter {
+        self.decoder.get_ref()
+    }
+
+    /// Finalize only a genuinely complete stream: one independent
+    /// `Flush::Finish` pass over the retained input, requiring
+    /// `Status::StreamEnd` — which flate2 documents as all input consumed, all
+    /// output written, and the adler-32 verified. Called only at ordinary EOF;
+    /// budget-triggered stops take the truncation path before this runs.
+    fn finish(self) -> io::Result<CappedWriter> {
+        if !Self::stream_is_complete(&self.offered_input) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete or malformed deflate (zlib) stream",
+            ));
+        }
+        self.decoder.finish()
+    }
+
+    /// The verification scratch output reproduces bytes the sink already
+    /// accepted, so it stays within the decoded-size class the caps already
+    /// bound. Each pass must consume input or produce output; one that cannot
+    /// reach `StreamEnd` leaves the stream incomplete or corrupt.
+    fn stream_is_complete(offered: &[u8]) -> bool {
+        let mut verify = flate2::Decompress::new(true);
+        let mut scratch: Vec<u8> = Vec::new();
+        loop {
+            if scratch.len() == scratch.capacity() {
+                scratch.reserve(8192);
+            }
+            let (before_in, before_out) = (verify.total_in(), verify.total_out());
+            let consumed = verify.total_in() as usize;
+            match verify.decompress_vec(
+                &offered[consumed..],
+                &mut scratch,
+                flate2::FlushDecompress::Finish,
+            ) {
+                Ok(flate2::Status::StreamEnd) => return true,
+                Ok(flate2::Status::Ok) => {
+                    if verify.total_in() == before_in && verify.total_out() == before_out {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+}
+
 // The compressed decoders are boxed: `brotli::DecompressorWriter` is far larger
 // than the identity sink, so an unboxed enum would carry that size everywhere.
 enum BodyDecoder {
@@ -100,7 +176,7 @@ enum BodyDecoder {
     // series of members, and the single-member decoder would silently return
     // only the first one as if it were the whole response.
     Gzip(Box<flate2::write::MultiGzDecoder<CappedWriter>>),
-    Zlib(Box<flate2::write::ZlibDecoder<CappedWriter>>),
+    Zlib(Box<CompletionTrackedZlib>),
     Brotli(Box<brotli::DecompressorWriter<CappedWriter>>),
 }
 
@@ -122,7 +198,10 @@ impl BodyDecoder {
             )))),
             // HTTP `deflate` is zlib-wrapped in practice (and reqwest decoded it
             // that way); the tests encode with `flate2`'s ZlibEncoder.
-            "deflate" => Some(Self::Zlib(Box::new(flate2::write::ZlibDecoder::new(sink)))),
+            "deflate" => Some(Self::Zlib(Box::new(CompletionTrackedZlib {
+                decoder: Box::new(flate2::write::ZlibDecoder::new(sink)),
+                offered_input: Vec::new(),
+            }))),
             "br" => Some(Self::Brotli(Box::new(brotli::DecompressorWriter::new(
                 sink, 4096,
             )))),
@@ -394,6 +473,13 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn zlib_member(payload: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
     /// Returns the decoded bytes, whether a budget cut the body short, and how
     /// many decoded bytes the decompressor produced in total.
     fn decode_chunks(
@@ -536,16 +622,18 @@ mod tests {
     #[test]
     fn oversized_chunk_never_feeds_past_the_input_allowance() {
         // An allowance worth four empty members. The first chunk consumes one
-        // member; the second chunk carries eight (larger than the remaining
-        // three) and decodes to nothing, so only the input clip can keep the
-        // decoder within the allowance. A final push after exhaustion must not
-        // feed the payload member the decoder would happily expand, so the
-        // assertions observe what the decoder was actually given, not just the
-        // returned flag.
+        // member; the second chunk exceeds the remaining three and carries an
+        // output-producing member immediately after the allowance-aligned
+        // prefix, so a regression that fed the whole chunk while accounting
+        // only the clipped slice would surface in the decoder's own output
+        // meter. A final push after exhaustion must not feed the payload
+        // member either, so the assertions observe what the decoder was
+        // actually given, not just the returned flag.
         let empty_member = gzip_member(b"");
         let payload_member = gzip_member(b"after-exhaustion");
         let budget = empty_member.len() * 4;
-        let low_yield_chunk = empty_member.repeat(8);
+        let mut low_yield_chunk = empty_member.repeat(3);
+        low_yield_chunk.extend_from_slice(&payload_member);
         assert!(
             low_yield_chunk.len() > budget - empty_member.len(),
             "the chunk must exceed the remaining allowance"
@@ -593,5 +681,53 @@ mod tests {
         let error = decode_chunks(&["gzip"], Some(1024), &[b"definitely not gzip"])
             .expect_err("a malformed stream must not decode as text");
         assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn empty_deflate_body_is_a_malformed_stream() {
+        // flate2's write-mode zlib finalizer reports success whenever output
+        // stops growing, and the miniz backend maps "needs more input" at
+        // Finish to a success-variant status. A GET 200 advertising deflate
+        // with zero body bytes is not an encoded empty representation — there
+        // is no zlib stream at all — and must fail, exactly like the gzip
+        // missing-trailer case already does.
+        let error = decode_chunks(&["deflate"], Some(1024), &[])
+            .expect_err("an empty deflate body has no zlib stream to finish");
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete or malformed deflate"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn deflate_stream_missing_trailer_is_a_malformed_stream() {
+        // A zlib body whose adler32 trailer was cut off decodes its payload
+        // but never completes; the reader must report the unfinished stream
+        // instead of returning the decoded bytes as a complete body.
+        let mut stream = zlib_member(b"payload");
+        let trailer_len = 4; // adler32
+        stream.truncate(stream.len() - trailer_len);
+        let error = decode_chunks(&["deflate"], Some(1024), &[&stream])
+            .expect_err("a zlib stream without its trailer is incomplete");
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete or malformed deflate"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn complete_empty_deflate_stream_is_a_valid_empty_body() {
+        // Positive control: a complete zlib stream that encodes zero bytes is
+        // a legitimate empty body. The completion check must distinguish
+        // "empty because the stream is complete" from "empty because bytes
+        // are missing".
+        let stream = zlib_member(b"");
+        let (bytes, truncated, _) = decode_chunks(&["deflate"], Some(1024), &[&stream]).unwrap();
+        assert!(bytes.is_empty(), "the stream encodes nothing");
+        assert!(!truncated, "a complete stream is not truncation");
     }
 }
