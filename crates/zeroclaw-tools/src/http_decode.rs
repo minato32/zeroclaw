@@ -245,10 +245,34 @@ impl BoundedDecode {
     /// Feed one chunk. Returns `false` once a budget is spent and no further
     /// chunk should be read.
     fn push(&mut self, chunk: &[u8]) -> io::Result<bool> {
+        // A spent budget already ended the read; a repeated call must not feed
+        // the decoder again.
+        if self.stopped_early {
+            return Ok(false);
+        }
+        // Clip the chunk to the remaining compressed-input allowance before the
+        // decoder sees any of it. Feeding the whole transport chunk first would
+        // let one chunk overshoot the allowance by its full size, which is
+        // exactly the unbounded low-yield decoder work this budget exists to
+        // prevent.
+        let offered = match self.input_budget {
+            Some(budget) => {
+                let remaining = budget.saturating_sub(self.consumed);
+                if remaining == 0 {
+                    self.stopped_early = true;
+                    return Ok(false);
+                }
+                &chunk[..chunk.len().min(remaining)]
+            }
+            None => chunk,
+        };
         let written = self
             .decoder
-            .write_all(chunk)
+            .write_all(offered)
             .and_then(|()| self.decoder.flush());
+        // Account what was offered even when the decoded-output cap ends the
+        // write, so the input meter always matches the bytes actually fed.
+        self.consumed = self.consumed.saturating_add(offered.len());
         if let Err(error) = written {
             // The sink refuses output once the decoded budget is spent; any
             // other failure is a genuine malformed-stream error.
@@ -258,7 +282,6 @@ impl BoundedDecode {
             self.stopped_early = true;
             return Ok(false);
         }
-        self.consumed = self.consumed.saturating_add(chunk.len());
         if self.decoder.is_full()
             || self
                 .input_budget
@@ -457,6 +480,61 @@ mod tests {
         assert!(
             truncated,
             "spending the compressed-input budget must be reported as truncation"
+        );
+    }
+
+    #[test]
+    fn oversized_chunk_never_feeds_past_the_input_allowance() {
+        // An allowance worth four empty members. The first chunk consumes one
+        // member; the second chunk carries eight (larger than the remaining
+        // three) and decodes to nothing, so only the input clip can keep the
+        // decoder within the allowance. A final push after exhaustion must not
+        // feed the payload member the decoder would happily expand, so the
+        // assertions observe what the decoder was actually given, not just the
+        // returned flag.
+        let empty_member = gzip_member(b"");
+        let payload_member = gzip_member(b"after-exhaustion");
+        let budget = empty_member.len() * 4;
+        let low_yield_chunk = empty_member.repeat(8);
+        assert!(
+            low_yield_chunk.len() > budget - empty_member.len(),
+            "the chunk must exceed the remaining allowance"
+        );
+
+        let codings = vec!["gzip".to_string()];
+        let mut decode = BoundedDecode::new(&codings, 1024, Some(budget)).unwrap();
+
+        assert!(
+            decode.push(&empty_member).unwrap(),
+            "the first member fits inside the allowance"
+        );
+        assert!(
+            !decode.push(&low_yield_chunk).unwrap(),
+            "an oversized chunk must end the read at the allowance"
+        );
+        assert!(
+            !decode.push(&payload_member).unwrap(),
+            "a call after exhaustion must not feed the decoder"
+        );
+
+        assert_eq!(
+            decode.consumed, budget,
+            "offered input must stop exactly at the allowance"
+        );
+        assert_eq!(
+            decode.decoded_offered(),
+            0,
+            "the decoder must have produced nothing beyond the empty members"
+        );
+        let (bytes, truncated) = decode.finish().unwrap();
+        assert!(
+            truncated,
+            "a spent input allowance is truncation, not a malformed stream"
+        );
+        assert!(
+            bytes.is_empty(),
+            "the payload member must never reach the decoder, got {:?}",
+            String::from_utf8_lossy(&bytes)
         );
     }
 
