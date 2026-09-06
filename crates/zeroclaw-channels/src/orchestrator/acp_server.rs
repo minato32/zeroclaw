@@ -2346,14 +2346,18 @@ impl AcpServer {
     /// rather than deleted so the model still sees that something was attached.
     ///
     /// A failed turn is the run of messages ending at the durable failure
-    /// sentinel and beginning at the user prompt that opened it. Recognition is
-    /// structural (`is_failure_sentinel`), so a transcript persisted under one
-    /// locale degrades correctly after a restart under another. Only the
-    /// provider seed is touched; the stored transcript still replays the image
-    /// to the client. Each sentinel is then projected to its localized marker
-    /// by `project_failure_sentinels` before the seed reaches the agent.
+    /// sentinel and beginning at the turn-opening user prompt that started it.
+    /// The opening prompt is found with the shared turn-opening predicate, so
+    /// a prompt-mode `[Tool results]` carrier between the prompt and the
+    /// failure does not cut the span short and leave the prompt's attachment
+    /// in the seed. Recognition is structural (`is_failure_sentinel`), so a
+    /// transcript persisted under one locale degrades correctly after a
+    /// restart under another. Only the provider seed is touched; the stored
+    /// transcript still replays the image to the client. Each sentinel is then
+    /// projected to its localized marker by `project_failure_sentinels` before
+    /// the seed reaches the agent.
     fn degrade_failed_turn_media(seed: &mut [ConversationMessage]) {
-        let is_user_prompt = |message: &ConversationMessage| matches!(message, ConversationMessage::Chat(chat) if chat.role == "user");
+        let is_turn_opening = zeroclaw_runtime::agent::is_turn_opening_user_message;
 
         let failure_marks: Vec<usize> = seed
             .iter()
@@ -2365,7 +2369,7 @@ impl AcpServer {
         for end in failure_marks {
             let start = seed[..end]
                 .iter()
-                .rposition(is_user_prompt)
+                .rposition(is_turn_opening)
                 .unwrap_or_default();
             zeroclaw_runtime::agent::degrade_media_in_messages(&mut seed[start..end]);
         }
@@ -7442,6 +7446,300 @@ mod tests {
             ),
             "the failed turn's transcript must keep the attachment for client replay: {:?}",
             stored.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_image_with_prompt_tool_results_degrades_media_on_both_paths() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        // A prompt-mode tool round appends its results as a user-role
+        // `[Tool results]` carrier, and typed replay preserves it as an
+        // ordinary user chat. A turn shaped `user(image) -> assistant(tool
+        // request) -> user([Tool results] ...) -> failure` therefore hides its
+        // opening prompt behind that carrier: a span selector that walks back
+        // to "the last user message" starts at the carrier, misses the image
+        // prompt, and leaves the rejected attachment in both the live history
+        // and the restored seed. This regression drives that exact shape
+        // through both repair paths with a vision-capable provider, which
+        // retains historical image markers, so a clean next request is only
+        // possible if the span reached the opening prompt.
+
+        // ── Phase A: restore path ────────────────────────────────────
+        let cwd = tempfile::tempdir().unwrap();
+        let image_path = cwd.path().join("carrier-rejected.png");
+        let file_bytes = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&image_path, file_bytes).unwrap();
+        let marker = format!("look at this [IMAGE:{}]", image_path.display());
+
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-carrier-failed-turn";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &AcpServer::failed_turn_transcript(vec![
+                    ConversationMessage::Chat(ChatMessage::user(marker.clone())),
+                    ConversationMessage::Chat(ChatMessage::assistant("let me read that file")),
+                    ConversationMessage::Chat(ChatMessage::user(format!(
+                        "[Tool results]\n{}",
+                        String::from_utf8_lossy(&file_bytes)
+                    ))),
+                ]),
+            )
+            .unwrap();
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed");
+
+        let mut notifications = Vec::new();
+        while let Ok(msg) = writer_rx.try_recv() {
+            notifications.push(msg);
+        }
+        assert!(
+            notifications.iter().any(|n| n.contains("carrier-rejected.png")),
+            "the client must still replay the attachment: {notifications:?}"
+        );
+
+        let restore_requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let session = server
+                .sessions
+                .lock()
+                .await
+                .get(session_id)
+                .cloned()
+                .expect("loaded session must be active");
+            session
+                .lock()
+                .await
+                .agent
+                .set_model_provider(Box::new(RecordingVisionProvider {
+                    requests: Arc::clone(&restore_requests),
+                }));
+        }
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": "just text now" }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+
+        let restore_requests = restore_requests.lock();
+        assert_eq!(restore_requests.len(), 1, "expected one provider request");
+        for message in &restore_requests[0] {
+            assert!(
+                !message.content.contains("data:image"),
+                "the restored seed must not re-attach the rejected image past the tool carrier: {message:?}"
+            );
+        }
+        let omitted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-failed-attachment-omitted");
+        assert!(
+            restore_requests[0]
+                .iter()
+                .any(|message| message.content.contains(&omitted)),
+            "the restored seed should say an attachment was dropped: {:?}",
+            restore_requests[0]
+        );
+
+        // ── Phase B: live path through the real turn machinery ───────
+        // The provider advertises vision (no marker stripping) but no native
+        // tools (prompt mode). Round 0 requests a real auto-approved tool;
+        // round 1 fails non-retryably, leaving the carrier in the failed
+        // turn's history.
+        struct PromptToolVisionProvider {
+            requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
+            calls: std::sync::atomic::AtomicUsize,
+            tool_call_response: String,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for PromptToolVisionProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "PromptToolVisionProvider"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for PromptToolVisionProvider {
+            fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    native_tool_calling: false,
+                    vision: true,
+                    ..Default::default()
+                }
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("400 Bad Request: provider rejected the request")
+            }
+
+            async fn chat(
+                &self,
+                request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.requests.lock().push(request.messages.to_vec());
+                match call {
+                    0 => Ok(zeroclaw_api::model_provider::ChatResponse {
+                        text: Some(self.tool_call_response.clone()),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                        reasoning_content: None,
+                    }),
+                    1 => anyhow::bail!("400 Bad Request: provider rejected the request"),
+                    _ => Ok(zeroclaw_api::model_provider::ChatResponse {
+                        text: Some("recovered".to_string()),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                        reasoning_content: None,
+                    }),
+                }
+            }
+        }
+
+        let live_cwd = tempfile::tempdir().unwrap();
+        let live_image = live_cwd.path().join("carrier-live.png");
+        std::fs::write(&live_image, file_bytes).unwrap();
+        let live_marker = format!("look at this [IMAGE:{}]", live_image.display());
+        let tool_call_response = format!(
+            "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"{}\"}}}}\n</tool_call>",
+            live_image.display()
+        );
+
+        let live_store = Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(
+            live_cwd.path(),
+        )
+        .unwrap());
+        let live_server = Arc::new(AcpServer::new_with_store(
+            make_test_config(live_cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&live_store),
+        ));
+        let live_session = live_server
+            .handle_session_new(&serde_json::json!({
+                "cwd": live_cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed")["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let live_requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let session = live_server
+                .sessions
+                .lock()
+                .await
+                .get(&live_session)
+                .cloned()
+                .expect("new session must be active");
+            session.lock().await.agent.set_model_provider(Box::new(
+                PromptToolVisionProvider {
+                    requests: Arc::clone(&live_requests),
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    tool_call_response,
+                },
+            ));
+        }
+
+        // The image-bearing turn runs one prompt-mode tool round, then fails.
+        live_server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": live_session, "prompt": live_marker }),
+                &serde_json::json!(1),
+            )
+            .await
+            .expect_err("the provider rejection must fail the turn");
+
+        // Precondition: the failed turn really produced the carrier shape, and
+        // the durable transcript still carries the attachment for the client.
+        let stored = live_store
+            .load_session(&live_session)
+            .unwrap()
+            .expect("session record exists");
+        assert!(
+            stored.messages.iter().any(
+                |m| matches!(m, ConversationMessage::Chat(chat)
+                    if chat.role == "user" && chat.content.starts_with("[Tool results]"))
+            ),
+            "precondition: the failed turn must contain a prompt-mode tool-result carrier: {:?}",
+            stored.messages
+        );
+        assert!(
+            stored.messages.iter().any(
+                |m| matches!(m, ConversationMessage::Chat(chat) if chat.content.contains("carrier-live.png"))
+            ),
+            "the failed turn's transcript must keep the attachment for client replay: {:?}",
+            stored.messages
+        );
+
+        // The next active prompt must not re-attach the rejected image.
+        live_server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": live_session, "prompt": "just text now" }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+
+        let live_requests = live_requests.lock();
+        assert_eq!(
+            live_requests.len(),
+            3,
+            "two requests for the failed turn (tool round + failure), one for the next prompt: {:?}",
+            live_requests.len()
+        );
+        assert!(
+            live_requests[0].iter().any(|m| m.content.contains("data:image")),
+            "precondition: the first request carried the image"
+        );
+        for message in &live_requests[2] {
+            assert!(
+                !message.content.contains("data:image"),
+                "the rejected image must not be re-attached past the tool carrier: {message:?}"
+            );
+        }
+        assert!(
+            live_requests[2]
+                .iter()
+                .any(|message| message.content.contains(&omitted)),
+            "the live seed should say an attachment was dropped: {:?}",
+            live_requests[2]
         );
     }
 

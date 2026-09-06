@@ -3,6 +3,26 @@
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::multimodal;
 
+/// Whether this typed message opens a turn for failed-turn span purposes: a
+/// user message that is not the runtime's prompt-mode `[Tool results]` result
+/// carrier.
+///
+/// A prompt-mode tool round appends its results as a user-role message (see
+/// `history_append::append_tool_round_to_history`), and typed replay preserves
+/// that carrier as an ordinary user chat. A selector that walks back to "the
+/// last user message" would otherwise start the failed-turn span at the
+/// carrier and miss the user prompt that actually opened the turn — including
+/// the attachments that prompt carried. The same prefix rule the whole-turn
+/// trimmer uses for flat boundaries applies here.
+pub fn is_turn_opening_user_message(message: &ConversationMessage) -> bool {
+    matches!(
+        message,
+        ConversationMessage::Chat(chat)
+            if chat.role == "user"
+                && !chat.content.starts_with(crate::agent::history_trim::TOOL_RESULTS_PREFIX)
+    )
+}
+
 /// Replace image references in this message span with an omission note.
 ///
 /// A turn that ended in a non-retryable failure may have had its attachments
