@@ -1096,7 +1096,9 @@ impl Agent {
 
     /// Remove the trailing assistant interruption marker
     /// (`turn-interrupted-by-user`) the tool loop appends to live history when a
-    /// turn is cancelled, returning whether one was removed.
+    /// turn is cancelled, returning whether one was removed. When cancellation
+    /// folds the marker into a partial assistant response, preserve the partial
+    /// response and remove only the runtime-owned marker suffix.
     ///
     /// External surfaces that project cancellation differently on their durable
     /// transcript (the ACP channel records a structured, replay-only cancellation
@@ -1113,8 +1115,21 @@ impl Agent {
         );
         if is_marker {
             self.history.pop();
+            return true;
         }
-        is_marker
+
+        let folded_suffix = format!("\n\n{marker}");
+        let Some(ConversationMessage::Chat(message)) = self.history.last_mut() else {
+            return false;
+        };
+        if message.role != "assistant" || !message.content.ends_with(&folded_suffix) {
+            return false;
+        }
+
+        message
+            .content
+            .truncate(message.content.len() - folded_suffix.len());
+        true
     }
 
     /// Degrade image references in the trailing turn of live history.
@@ -1133,9 +1148,11 @@ impl Agent {
     ///
     /// Returns the number of image references degraded.
     pub fn degrade_trailing_turn_media(&mut self) -> usize {
-        let Some(start) = self.history.iter().rposition(
-            crate::agent::turn::media_degrade::is_turn_opening_user_message,
-        ) else {
+        let Some(start) = self
+            .history
+            .iter()
+            .rposition(crate::agent::turn::media_degrade::is_turn_opening_user_message)
+        else {
             return 0;
         };
         crate::agent::turn::media_degrade::degrade_media_in_messages(&mut self.history[start..])
@@ -11583,6 +11600,35 @@ mod tests {
             builder = builder.provider_switch_config(cfg);
         }
         builder.build().expect("agent builder")
+    }
+
+    #[test]
+    fn strip_trailing_interruption_marker_preserves_folded_partial_response() {
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
+        let marker = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::user("prompt")),
+            ConversationMessage::Chat(ChatMessage::assistant(format!("partial text\n\n{marker}"))),
+        ];
+
+        assert!(agent.strip_trailing_interruption_marker());
+        assert!(matches!(
+            agent.history.last(),
+            Some(ConversationMessage::Chat(message))
+                if message.role == "assistant" && message.content == "partial text"
+        ));
+
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(
+                "ordinary assistant text",
+            )));
+        assert!(!agent.strip_trailing_interruption_marker());
+        assert!(matches!(
+            agent.history.last(),
+            Some(ConversationMessage::Chat(message))
+                if message.content == "ordinary assistant text"
+        ));
     }
 
     #[test]
