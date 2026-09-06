@@ -1117,6 +1117,27 @@ impl Agent {
         is_marker
     }
 
+    /// Degrade image references in the trailing turn of live history.
+    ///
+    /// A turn that just ended in a non-retryable failure is the newest whole
+    /// turn: its user prompt is the last user message and nothing was appended
+    /// after the failure. Any attachment in that span was already rejected (or
+    /// already defeated the request), so leaving it in place resends it on the
+    /// next prompt of the same still-active session and reproduces the failure.
+    /// The span is projected in place with the shared failed-turn media
+    /// degradation (see `media_degrade::degrade_media_in_messages`); the durable
+    /// transcript keeps the original content for client replay.
+    ///
+    /// Returns the number of image references degraded.
+    pub fn degrade_trailing_turn_media(&mut self) -> usize {
+        let Some(start) = self.history.iter().rposition(
+            |message| matches!(message, ConversationMessage::Chat(chat) if chat.role == "user"),
+        ) else {
+            return 0;
+        };
+        crate::agent::turn::media_degrade::degrade_media_in_messages(&mut self.history[start..])
+    }
+
     pub fn channel_handles(&self) -> &AgentChannelHandles {
         &self.channel_handles
     }

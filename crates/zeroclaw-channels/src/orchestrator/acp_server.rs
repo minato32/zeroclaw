@@ -42,6 +42,16 @@ const CANCELLATION_EVENT_TOOL_ID: &str = "zeroclaw.acp.turn-cancelled.v1";
 /// arguments is not misclassified.
 const CANCELLATION_EVENT_TOOL_ARGS: &str = "{}";
 
+/// Durable failed-turn marker. A transcript stores this reserved,
+/// locale-independent sentinel where the failure boundary is; the localized
+/// `[turn failed]` text is projected when the transcript is restored (client
+/// replay and provider seed separately). Persisting the localized rendering
+/// instead would make failed-turn recognition depend on the process locale: a
+/// session saved under one locale and reloaded under another would no longer
+/// recognize its own failed turns, and a provider-rejected attachment would
+/// re-enter the next provider request.
+const FAILURE_TURN_SENTINEL: &str = "zeroclaw.acp.turn-failed.v1";
+
 /// Terminal result of a `session/prompt` turn, returned by the per-session turn
 /// task after it has already persisted the outcome's transcript while holding
 /// the session lock. The outer handler only needs to render the client-facing
@@ -1810,6 +1820,27 @@ impl AcpServer {
                     let persist_error = if failure.new_messages.is_empty() {
                         None
                     } else {
+                        // The failed turn is the trailing span of the live
+                        // history (its prompt is the last user message and
+                        // nothing appends after a failure). Its attachments
+                        // were rejected — degrade them here too, not just on
+                        // restore, or a vision-capable provider would re-attach
+                        // the same rejected image to the very next prompt of
+                        // this still-active session. The durable transcript
+                        // keeps the original content for client replay.
+                        let degraded = session.agent.degrade_trailing_turn_media();
+                        if degraded > 0 {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write).with_category(::zeroclaw_log::EventCategory::Channel)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                    .with_attrs(::serde_json::json!({
+                                        "session_id": persist_session_id,
+                                        "degraded_image_refs": degraded,
+                                    })),
+                                "Degraded rejected attachments in live ACP history after a failed turn"
+                            );
+                        }
                         Self::append_transcript(
                             persist_store,
                             persist_session_id,
@@ -2115,13 +2146,49 @@ impl AcpServer {
 
     /// Assemble the persisted transcript for a failed turn: the messages the
     /// turn produced before the error (user prompt, completed tool activity,
-    /// any partial assistant text) plus a trailing assistant failure marker so
-    /// the reloaded transcript explains why the turn stopped.
+    /// any partial assistant text) plus a trailing failure boundary so the
+    /// reloaded transcript explains why the turn stopped.
+    ///
+    /// The boundary is the reserved [`FAILURE_TURN_SENTINEL`], not the localized
+    /// marker: restore paths must recognize a failed turn no matter which locale
+    /// was active when it was persisted (or when it is restored). Localized text
+    /// is projected from the sentinel at the two projection boundaries —
+    /// provider seed (`project_failure_sentinels`) and client replay
+    /// (`history_notifications_for_message`) — never stored.
     fn failed_turn_transcript(mut messages: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
         messages.push(ConversationMessage::Chat(ChatMessage::assistant(
-            zeroclaw_runtime::i18n::get_required_cli_string("turn-failed"),
+            FAILURE_TURN_SENTINEL.to_string(),
         )));
         messages
+    }
+
+    /// A restored message is the durable failed-turn boundary exactly when it
+    /// is an assistant message carrying the reserved, locale-independent
+    /// [`FAILURE_TURN_SENTINEL`]. Structural, never a localized comparison: the
+    /// sentinel is written by this module alone and reads back identically
+    /// under every locale.
+    fn is_failure_sentinel(message: &ConversationMessage) -> bool {
+        matches!(
+            message,
+            ConversationMessage::Chat(chat)
+                if chat.role == "assistant" && chat.content == FAILURE_TURN_SENTINEL
+        )
+    }
+
+    /// Project durable failed-turn boundaries to their localized marker for the
+    /// provider seed. Runs after `degrade_failed_turn_media`, which still needs
+    /// the sentinel to find the failed-turn spans; by the time the seed reaches
+    /// `seed_conversation_history_with_event` the model sees the human-readable
+    /// localized `[turn failed]` marker, exactly as it did when the boundary was
+    /// persisted inline. The stored transcript keeps the sentinel; client
+    /// replay projects it separately (`history_notifications_for_message`).
+    fn project_failure_sentinels(seed: &mut [ConversationMessage]) {
+        let localized = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
+        for message in seed {
+            if Self::is_failure_sentinel(message) {
+                *message = ConversationMessage::Chat(ChatMessage::assistant(localized.clone()));
+            }
+        }
     }
 
     /// Build the persisted transcript for a client-cancelled turn. The runtime
@@ -2231,6 +2298,9 @@ impl AcpServer {
             .collect();
         let repaired = Self::repair_incomplete_tool_calls(&mut seed);
         Self::degrade_failed_turn_media(&mut seed);
+        // Runs after the degradation because the failure sentinel is what
+        // delimits the failed-turn spans the degradation repairs.
+        Self::project_failure_sentinels(&mut seed);
         (stored, seed, repaired)
     }
 
@@ -2244,23 +2314,20 @@ impl AcpServer {
     /// permanently poisoned transcript. The reference is replaced with a note
     /// rather than deleted so the model still sees that something was attached.
     ///
-    /// A failed turn is the run of messages ending at the `turn-failed` marker
-    /// and beginning at the user prompt that opened it. Only the provider seed
-    /// is touched; the stored transcript still replays the image to the client.
+    /// A failed turn is the run of messages ending at the durable failure
+    /// sentinel and beginning at the user prompt that opened it. Recognition is
+    /// structural (`is_failure_sentinel`), so a transcript persisted under one
+    /// locale degrades correctly after a restart under another. Only the
+    /// provider seed is touched; the stored transcript still replays the image
+    /// to the client. Each sentinel is then projected to its localized marker
+    /// by `project_failure_sentinels` before the seed reaches the agent.
     fn degrade_failed_turn_media(seed: &mut [ConversationMessage]) {
-        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
-        let omitted =
-            zeroclaw_runtime::i18n::get_required_cli_string("turn-failed-attachment-omitted");
-        let is_failure_marker = |message: &ConversationMessage| {
-            matches!(message, ConversationMessage::Chat(chat)
-                if chat.role == "assistant" && chat.content == marker)
-        };
         let is_user_prompt = |message: &ConversationMessage| matches!(message, ConversationMessage::Chat(chat) if chat.role == "user");
 
         let failure_marks: Vec<usize> = seed
             .iter()
             .enumerate()
-            .filter(|(_, message)| is_failure_marker(message))
+            .filter(|(_, message)| Self::is_failure_sentinel(message))
             .map(|(index, _)| index)
             .collect();
 
@@ -2269,21 +2336,7 @@ impl AcpServer {
                 .iter()
                 .rposition(is_user_prompt)
                 .unwrap_or_default();
-            for message in &mut seed[start..end] {
-                let ConversationMessage::Chat(chat) = message else {
-                    continue;
-                };
-                let (cleaned, refs) =
-                    zeroclaw_providers::multimodal::parse_image_markers(&chat.content);
-                if refs.is_empty() {
-                    continue;
-                }
-                chat.content = if cleaned.is_empty() {
-                    omitted.clone()
-                } else {
-                    format!("{cleaned}\n\n{omitted}")
-                };
-            }
+            zeroclaw_runtime::agent::degrade_media_in_messages(&mut seed[start..end]);
         }
     }
 
@@ -3116,6 +3169,25 @@ fn history_notifications_for_message(
 ) -> Vec<JsonRpcNotification> {
     match msg {
         ConversationMessage::Chat(chat) => {
+            // The durable failed-turn boundary projects to its localized
+            // marker here, at the client replay boundary: the stored row is
+            // the reserved sentinel, so a transcript persisted under one
+            // locale replays with the current locale's `[turn failed]` text
+            // instead of leaking the raw sentinel to the client.
+            if AcpServer::is_failure_sentinel(msg) {
+                let localized = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
+                return vec![JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": localized }
+                        }
+                    }),
+                }];
+            }
             let update_type = match chat.role.as_str() {
                 "user" => "user_message_chunk",
                 "assistant" => "agent_message_chunk",
@@ -3331,6 +3403,67 @@ mod tests {
     }
 
     use zeroclaw_api::model_provider::ModelProvider;
+
+    /// Like `RecordingNativeProvider` but advertises vision, so historical
+    /// image markers are *retained* on the way to the provider instead of
+    /// stripped by the text-only degrade path. A request recorded here
+    /// genuinely carries whatever media the seed still contains, which makes
+    /// the failed-media regressions discriminate: a resent rejected image
+    /// shows up as a `[IMAGE:data:...]` part, a degraded one as the omission
+    /// note only.
+    struct RecordingVisionProvider {
+        requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecordingVisionProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "RecordingVisionProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RecordingVisionProvider {
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: true,
+                vision: true,
+                ..Default::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("recovered".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            self.requests.lock().push(request.messages.to_vec());
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text: Some("recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
 
     #[test]
     fn usage_event_has_no_acp_notification() {
@@ -6173,17 +6306,23 @@ mod tests {
                 .any(|m| matches!(m, ConversationMessage::ToolResults(_))),
             "failed turn must retain the tool result"
         );
-        // Failure marker appended as the final message.
-        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
+        // Failure boundary appended as the final message. The stored row is
+        // the reserved, locale-independent sentinel — NOT the localized
+        // marker — so restore recognizes the failed turn under any locale.
         match data.messages.last() {
             Some(ConversationMessage::Chat(chat)) => {
                 assert_eq!(chat.role, "assistant");
                 assert_eq!(
-                    chat.content, marker,
-                    "trailing message must be the failure marker"
+                    chat.content, FAILURE_TURN_SENTINEL,
+                    "trailing message must be the durable failure sentinel"
+                );
+                assert_ne!(
+                    chat.content,
+                    zeroclaw_runtime::i18n::get_required_cli_string("turn-failed"),
+                    "the durable boundary must not be the localized rendering"
                 );
             }
-            other => panic!("expected trailing failure marker, got {other:?}"),
+            other => panic!("expected trailing failure sentinel, got {other:?}"),
         }
     }
 
@@ -6440,7 +6579,7 @@ mod tests {
             .expect_err("a non-retryable provider failure must surface as an RPC error");
 
         // The failed turn's visible transcript (the user prompt) plus a trailing
-        // failure marker must have been persisted via the production path.
+        // failure boundary must have been persisted via the production path.
         let data = store
             .load_session(&session_id)
             .unwrap()
@@ -6454,10 +6593,12 @@ mod tests {
             "failed turn must persist the user prompt: {:?}",
             data.messages
         );
-        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
         assert!(
-            matches!(data.messages.last(), Some(ConversationMessage::Chat(chat)) if chat.content == marker),
-            "failed turn must end with the turn-failed marker: {:?}",
+            matches!(
+                data.messages.last(),
+                Some(ConversationMessage::Chat(chat)) if chat.content == FAILURE_TURN_SENTINEL
+            ),
+            "failed turn must end with the durable failure sentinel: {:?}",
             data.messages
         );
     }
@@ -6929,6 +7070,325 @@ mod tests {
                 .any(|message| message.content.contains(&omitted)),
             "the seed should say an attachment was dropped, not silently lose it: {:?}",
             requests[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_failed_turn_is_recognized_across_locales() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        // A failed image turn is persisted through the production boundary and
+        // reloaded by a process that did not render its marker. Durable
+        // identity is the reserved sentinel, not the localized `[turn failed]`
+        // text, so recognition cannot depend on the locale: the provider seed
+        // omits the rejected attachment while the client replay keeps the
+        // attachment and renders the marker localized at projection time.
+        let cwd = tempfile::tempdir().unwrap();
+        let image_path = cwd.path().join("cross-locale.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+        let marker = format!("look at this [IMAGE:{}]", image_path.display());
+
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-cross-locale-failed-turn";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &AcpServer::failed_turn_transcript(vec![ConversationMessage::Chat(
+                    ChatMessage::user(marker.clone()),
+                )]),
+            )
+            .unwrap();
+
+        // The whole invariant: the durable boundary reads back as the
+        // sentinel, not as whichever rendering the active locale produces.
+        // Persisting the localized string instead would make a transcript
+        // saved under one locale unrecognizable after a restart under another.
+        let stored_marker = match store
+            .load_session(session_id)
+            .unwrap()
+            .expect("session record exists")
+            .messages
+            .pop()
+        {
+            Some(ConversationMessage::Chat(chat)) => chat.content,
+            other => panic!("expected a trailing chat message, got {other:?}"),
+        };
+        assert_eq!(
+            stored_marker, FAILURE_TURN_SENTINEL,
+            "the durable failure boundary must be the locale-independent sentinel"
+        );
+        assert_ne!(
+            stored_marker,
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-failed"),
+            "the durable boundary must not be the active locale's rendering"
+        );
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed");
+
+        let mut notifications = Vec::new();
+        while let Ok(msg) = writer_rx.try_recv() {
+            notifications.push(msg);
+        }
+        let localized = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
+        assert!(
+            notifications.iter().any(|n| n.contains("cross-locale.png")),
+            "the client must still replay the attachment the user sent: {notifications:?}"
+        );
+        assert!(
+            notifications.iter().any(|n| n.contains(&localized)),
+            "the client must see the failure marker localized at projection time: {notifications:?}"
+        );
+        assert!(
+            !notifications
+                .iter()
+                .any(|n| n.contains(FAILURE_TURN_SENTINEL)),
+            "the raw durable sentinel must never reach the client: {notifications:?}"
+        );
+
+        // Vision-capable: historical image markers are retained, not stripped,
+        // so the only way the request stays clean is the seed degradation.
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .expect("loaded session must be active");
+        session
+            .lock()
+            .await
+            .agent
+            .set_model_provider(Box::new(RecordingVisionProvider {
+                requests: Arc::clone(&requests),
+            }));
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": "just text now" }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly one provider request");
+        for message in &requests[0] {
+            assert!(
+                !message.content.contains("data:image"),
+                "the rejected attachment must not be re-attached to the provider request: {message:?}"
+            );
+        }
+        let omitted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-failed-attachment-omitted");
+        assert!(
+            requests[0]
+                .iter()
+                .any(|message| message.content.contains(&omitted)),
+            "the seed should say an attachment was dropped: {:?}",
+            requests[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_image_turn_degrades_media_on_the_active_session() {
+        use std::sync::Arc as StdArc;
+
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        // The restore path is not the only poisoned path. The failed turn is
+        // also the trailing span of the LIVE agent history, and a
+        // vision-capable provider retains historical image markers: without a
+        // live correction the same rejected attachment is re-attached to the
+        // very next prompt of the same still-active session. The first
+        // provider call rejects the image (non-retryable); the second prompt
+        // must go out without it while the durable transcript keeps it.
+        struct RejectingVisionProvider {
+            requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
+            first_call_done: StdArc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for RejectingVisionProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "RejectingVisionProvider"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for RejectingVisionProvider {
+            fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    native_tool_calling: true,
+                    vision: true,
+                    ..Default::default()
+                }
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("provider rejected the request")
+            }
+
+            async fn chat(
+                &self,
+                request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+                self.requests.lock().push(request.messages.to_vec());
+                if !self
+                    .first_call_done
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    // A 4xx-shaped message classifies non-retryable, so the
+                    // first prompt fails after exactly one provider request.
+                    anyhow::bail!("400 Bad Request: provider rejected the request");
+                }
+                Ok(zeroclaw_api::model_provider::ChatResponse {
+                    text: Some("recovered".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        let cwd = tempfile::tempdir().unwrap();
+        let image_path = cwd.path().join("rejected-live.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+        let marker = format!("look at this [IMAGE:{}]", image_path.display());
+
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+        let session_id = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed")["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let session = server
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .expect("new session must be active");
+            session
+                .lock()
+                .await
+                .agent
+                .set_model_provider(Box::new(RejectingVisionProvider {
+                    requests: Arc::clone(&requests),
+                    first_call_done: StdArc::new(std::sync::atomic::AtomicBool::new(false)),
+                }));
+        }
+
+        // Prompt 1: the image goes out and the provider rejects it.
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": marker }),
+                &serde_json::json!(1),
+            )
+            .await
+            .expect_err("the rejected image must fail the turn");
+
+        // Prompt 2, same active session: the rejected attachment must not be
+        // re-attached.
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": "just text now" }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 2, "both prompts reached the provider");
+        assert!(
+            requests[0].iter().any(|m| m.content.contains("data:image")),
+            "precondition: the first request carried the image: {:?}",
+            requests[0]
+        );
+        for message in &requests[1] {
+            assert!(
+                !message.content.contains("data:image"),
+                "the rejected attachment must not be re-attached to the next active request: {message:?}"
+            );
+            assert!(
+                !message.content.contains("rejected-live.png"),
+                "not even the marker text may survive into the next request: {message:?}"
+            );
+        }
+        let omitted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-failed-attachment-omitted");
+        assert!(
+            requests[1]
+                .iter()
+                .any(|message| message.content.contains(&omitted)),
+            "the seed should say an attachment was dropped: {:?}",
+            requests[1]
+        );
+
+        // The client-visible durable transcript keeps the attachment.
+        let stored = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record exists");
+        assert!(
+            stored.messages.iter().any(
+                |m| matches!(m, ConversationMessage::Chat(chat) if chat.content.contains("rejected-live.png"))
+            ),
+            "the failed turn's transcript must keep the attachment for client replay: {:?}",
+            stored.messages
         );
     }
 
