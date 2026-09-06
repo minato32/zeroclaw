@@ -1525,13 +1525,39 @@ impl AcpServer {
             );
         }
 
+        // Join the session's lifecycle guard before removing the map entry, so
+        // close participates in the same coordination the prompt used at
+        // admission: a `session/prompt` holds this gate from admission through
+        // its terminal transcript commit — including the scheduling window
+        // after the handler validated and spawned its turn task but before
+        // that task first acquires the session lock. Without this, close could
+        // remove the entry and acquire the still-free session lock, return,
+        // and only then let the parked task run and append its terminal
+        // outcome. With it, close parks on the gate while the prompt
+        // revalidates (the entry is still present), runs under the token
+        // cancelled above, and commits its terminal transcript before the gate
+        // frees. Same ordering `session/load`/`session/resume` already use.
+        let finalize_gate = self.session_gate(session_id);
+        let finalize_guard = finalize_gate.lock().await;
+
         let session_arc = {
             let mut sessions = self.sessions.lock().await;
-            sessions.remove(session_id).ok_or_else(|| RpcError {
-                code: SESSION_NOT_FOUND,
-                message: format!("Session not found: {session_id}"),
-                data: None,
-            })?
+            match sessions.remove(session_id) {
+                Some(arc) => arc,
+                None => {
+                    // `session_gate` created the entry on a miss, so release it
+                    // the same way a rejected restore does. Both owners we
+                    // added (guard + Arc clone) must be gone before reclaim.
+                    drop(finalize_guard);
+                    drop(finalize_gate);
+                    self.reclaim_session_gate(session_id);
+                    return Err(RpcError {
+                        code: SESSION_NOT_FOUND,
+                        message: format!("Session not found: {session_id}"),
+                        data: None,
+                    });
+                }
+            }
         };
 
         // Wait for any in-flight turn to finish (the cancel token may have already stopped it).
@@ -1555,6 +1581,11 @@ impl AcpServer {
         );
 
         drop(session);
+        // Both owners we added (guard + Arc clone) must be gone before
+        // reclamation: `reclaim_session_gate` only removes entries the map
+        // solely owns.
+        drop(finalize_guard);
+        drop(finalize_gate);
         self.reclaim_session_gate(session_id);
         Ok(serde_json::json!({}))
     }
@@ -2636,13 +2667,31 @@ impl AcpServer {
             );
         }
 
+        // Same lifecycle guard as `session/close`: wait out an admitted prompt
+        // that holds the finalization gate — including one whose turn task is
+        // spawned but has not yet acquired the session lock — so stop cannot
+        // return before that task has persisted its terminal outcome.
+        let finalize_gate = self.session_gate(session_id);
+        let finalize_guard = finalize_gate.lock().await;
+
         let session_arc = {
             let mut sessions = self.sessions.lock().await;
-            sessions.remove(session_id).ok_or_else(|| RpcError {
-                code: SESSION_NOT_FOUND,
-                message: format!("Session not found: {session_id}"),
-                data: None,
-            })?
+            match sessions.remove(session_id) {
+                Some(arc) => arc,
+                None => {
+                    // `session_gate` created the entry on a miss, so release it
+                    // the same way a rejected restore does. Both owners we
+                    // added (guard + Arc clone) must be gone before reclaim.
+                    drop(finalize_guard);
+                    drop(finalize_gate);
+                    self.reclaim_session_gate(session_id);
+                    return Err(RpcError {
+                        code: SESSION_NOT_FOUND,
+                        message: format!("Session not found: {session_id}"),
+                        data: None,
+                    });
+                }
+            }
         };
 
         // Wait for any in-flight prompt turn to finish before cleaning up.
@@ -2668,6 +2717,10 @@ impl AcpServer {
             "ACP session stopped"
         );
         drop(session);
+        // Same reclaim ordering as `session/close`: both owners we added
+        // (guard + Arc clone) must be gone before reclamation.
+        drop(finalize_guard);
+        drop(finalize_gate);
         self.reclaim_session_gate(session_id);
         Ok(serde_json::json!({
             "sessionId": session_id,
@@ -8013,23 +8066,33 @@ mod tests {
             .await
             .expect_err("load must block on the finalization gate while the prompt is in flight");
 
-        // `session/close` removes the live map entry (opening the window the gate
-        // protects), cancels the parked turn, and waits on the session lock. The
-        // turn commits its terminal transcript under the gate; only then does the
-        // load acquire the gate and read the committed rows.
-        let close_server = Arc::clone(&server);
-        let close_sid = session_id.clone();
-        let close = zeroclaw_spawn::spawn!(async move {
-            close_server
-                .handle_session_close(&serde_json::json!({ "sessionId": close_sid }))
-                .await
-        });
-        // Belt-and-suspenders in case cancellation did not abort the parked call.
+        // Close participates in the same lifecycle guard: it cannot remove the
+        // map entry while the prompt holds the gate, so the prompt terminalizes
+        // (committing its transcript) before close proceeds. Deterministic order:
+        // release the parked turn, let it finish, then close, then load.
         release.notify_one();
         prompt.await.unwrap().expect("prompt resolves");
-        close.await.unwrap().expect("close resolves");
-        load.await
+
+        // The racing load wakes after the prompt released the gate, but the
+        // session is still active (close has not run yet), so it is correctly
+        // rejected instead of seeding a replacement underneath it.
+        let racing_load = load
+            .await
             .unwrap()
+            .expect_err("a load racing an active session must be rejected");
+        assert_eq!(racing_load.code, INVALID_PARAMS, "already-active rejection");
+
+        // Close removes the entry only after the prompt's terminal transcript
+        // is committed.
+        server
+            .handle_session_close(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("close resolves");
+
+        // An immediate load after close reads the committed rows.
+        server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
             .expect("load resolves against committed rows");
 
         assert!(
@@ -8041,6 +8104,253 @@ mod tests {
                 .len()
                 > before,
             "the terminal transcript must be committed before the load reads the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_during_admitted_prompt_waits_for_terminal_persistence() {
+        use std::sync::Arc as StdArc;
+
+        // The scheduling window the lock-await cannot cover: `session/prompt`
+        // has validated and spawned its turn task, but that task has not yet
+        // been polled, so the session mutex is still free. The test holds the
+        // session lock to park the spawned task there, closes while the prompt
+        // holds the finalization gate, and then releases the lock. Close must
+        // not return before the admitted prompt's terminal (cancelled)
+        // transcript is committed, and nothing may append after it returns.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+        let session_id = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed")["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Records any provider call; the cancelled turn must abort at the
+        // tool loop's first cancellation check, before the provider is reached.
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let session = server
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .expect("new session must be active");
+            session
+                .lock()
+                .await
+                .agent
+                .set_model_provider(Box::new(RecordingNativeProvider {
+                    requests: Arc::clone(&requests),
+                }));
+        }
+
+        let before = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record exists")
+            .messages
+            .len();
+
+        // Hold the session lock so the spawned turn task parks before its
+        // first poll of the agent — the post-validation/pre-lock window.
+        let session_arc = server
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("session must be active");
+        let session_guard = session_arc.lock().await;
+
+        let prompt_server = StdArc::clone(&server);
+        let prompt_sid = session_id.clone();
+        let prompt = zeroclaw_spawn::spawn!(async move {
+            prompt_server
+                .handle_session_prompt(
+                    &serde_json::json!({ "sessionId": prompt_sid, "prompt": "hi" }),
+                    &serde_json::json!(1),
+                )
+                .await
+        });
+
+        // Deterministic barrier: wait until the prompt holds the finalization
+        // gate (past admission and generation revalidation). Close cannot
+        // remove the map entry while the gate is held, so from here on the
+        // prompt's terminalization is ordered before close returns. Drop our
+        // probe clone so it cannot hold the gate entry alive at reclaim time.
+        let gate = server.session_gate(&session_id);
+        loop {
+            if gate.try_lock().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(gate);
+
+        // Close while the turn task is spawned-but-not-yet-locked. It cancels
+        // the token and then parks on the gate the prompt holds.
+        let close_server = StdArc::clone(&server);
+        let close_sid = session_id.clone();
+        let close = zeroclaw_spawn::spawn!(async move {
+            close_server
+                .handle_session_close(&serde_json::json!({ "sessionId": close_sid }))
+                .await
+        });
+
+        // Release the lock: the task runs with the token already cancelled,
+        // aborts at the first cancellation check, and persists its terminal
+        // transcript while the prompt still holds the gate.
+        drop(session_guard);
+
+        close.await.unwrap().expect("close resolves");
+
+        let after_close = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record exists")
+            .messages
+            .len();
+        assert!(
+            after_close > before,
+            "close returned before the admitted prompt's terminal outcome was persisted"
+        );
+
+        // The turn aborted before dispatching anything to the provider.
+        assert!(
+            requests.lock().is_empty(),
+            "a turn cancelled in the admitted window must not reach the provider"
+        );
+
+        // And nothing appends after close has returned.
+        prompt.await.unwrap().expect("prompt resolves as cancelled");
+        let after_join = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record exists")
+            .messages
+            .len();
+        assert_eq!(
+            after_join, after_close,
+            "no terminal append may occur after close/stop returns"
+        );
+
+        // The gate was reclaimed once the last borrower left.
+        assert!(
+            server.session_gates.lock().unwrap().is_empty(),
+            "close must reclaim the finalization gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_during_admitted_prompt_waits_for_terminal_persistence() {
+        use std::sync::Arc as StdArc;
+
+        // Same scheduling window as the close variant, for `session/stop`.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+        let session_id = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed")["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let before = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record exists")
+            .messages
+            .len();
+
+        let session_arc = server
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("session must be active");
+        let session_guard = session_arc.lock().await;
+
+        let prompt_server = StdArc::clone(&server);
+        let prompt_sid = session_id.clone();
+        let prompt = zeroclaw_spawn::spawn!(async move {
+            prompt_server
+                .handle_session_prompt(
+                    &serde_json::json!({ "sessionId": prompt_sid, "prompt": "hi" }),
+                    &serde_json::json!(1),
+                )
+                .await
+        });
+
+        let gate = server.session_gate(&session_id);
+        loop {
+            if gate.try_lock().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(gate);
+
+        let stop_server = StdArc::clone(&server);
+        let stop_sid = session_id.clone();
+        let stop = zeroclaw_spawn::spawn!(async move {
+            stop_server
+                .handle_session_stop(&serde_json::json!({ "sessionId": stop_sid }))
+                .await
+        });
+
+        drop(session_guard);
+
+        stop.await.unwrap().expect("stop resolves");
+
+        let after_stop = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record exists")
+            .messages
+            .len();
+        assert!(
+            after_stop > before,
+            "stop returned before the admitted prompt's terminal outcome was persisted"
+        );
+
+        prompt.await.unwrap().expect("prompt resolves as cancelled");
+        let after_join = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record exists")
+            .messages
+            .len();
+        assert_eq!(
+            after_join, after_stop,
+            "no terminal append may occur after stop returns"
+        );
+        assert!(
+            server.session_gates.lock().unwrap().is_empty(),
+            "stop must reclaim the finalization gate"
         );
     }
 
