@@ -315,15 +315,37 @@ impl BoundedDecode {
     }
 }
 
+/// Whether HTTP semantics guarantee this response carries no message body, so
+/// representation metadata such as `Content-Encoding` cannot describe bytes a
+/// decoder would need: a `HEAD` request, or a status whose framing rules
+/// forbid a payload (informational responses, `204 No Content`, `304 Not
+/// Modified`). Finalizing a decompressor over the zero bytes such a response
+/// actually carries would report a missing trailer and turn a correct empty
+/// body into a spurious body-read failure; an empty body is the answer there.
+/// An ordinary `GET 200` with an empty or malformed compressed body still
+/// fails — nothing here bypasses decoding on the basis of representation
+/// metadata alone.
+fn response_has_no_body(method: Option<&reqwest::Method>, status: reqwest::StatusCode) -> bool {
+    method.is_some_and(|method| *method == reqwest::Method::HEAD)
+        || status.is_informational()
+        || status == reqwest::StatusCode::NO_CONTENT
+        || status == reqwest::StatusCode::NOT_MODIFIED
+}
+
 /// Read an HTTP response body, decoding `Content-Encoding: gzip | deflate | br`,
 /// and return it as text alongside whether it was truncated. `limit` is the
-/// decoded byte cap; `None` means unlimited. Returns an error on a body-stream
-/// failure, a malformed or unsupported encoding contract, or a malformed
-/// compressed body.
+/// decoded byte cap; `None` means unlimited. `method` is the request method
+/// when the caller knows it, enabling the bodyless bypass for `HEAD`; a
+/// GET-only caller passes `None`. Returns an error on a body-stream failure, a
+/// malformed or unsupported encoding contract, or a malformed compressed body.
 pub(crate) async fn read_decoded_text(
     response: reqwest::Response,
     limit: Option<usize>,
+    method: Option<reqwest::Method>,
 ) -> anyhow::Result<(String, bool)> {
+    if response_has_no_body(method.as_ref(), response.status()) {
+        return Ok((String::new(), false));
+    }
     // One byte over the limit, so the caller can still detect truncation.
     let decoded_cap = limit.map_or(usize::MAX, |value| value.saturating_add(1));
     let input_budget = limit.map(|value| value.saturating_add(COMPRESSED_INPUT_SLACK));
@@ -397,6 +419,34 @@ mod tests {
     #[test]
     fn absent_encoding_is_identity() {
         assert!(parse_content_codings(&headers(&[])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bodyless_semantics_cover_head_and_framing_forbidden_statuses() {
+        use reqwest::StatusCode;
+        let head = Some(&reqwest::Method::HEAD);
+        let get = Some(&reqwest::Method::GET);
+        let unknown_caller: Option<&reqwest::Method> = None;
+
+        // The method alone guarantees no body, whatever the status advertises.
+        assert!(response_has_no_body(head, StatusCode::OK));
+        assert!(response_has_no_body(head, StatusCode::NOT_MODIFIED));
+        // Statuses whose framing rules forbid a payload, whatever the method.
+        assert!(response_has_no_body(get, StatusCode::NO_CONTENT));
+        assert!(response_has_no_body(unknown_caller, StatusCode::NO_CONTENT));
+        assert!(response_has_no_body(
+            unknown_caller,
+            StatusCode::NOT_MODIFIED
+        ));
+        assert!(response_has_no_body(get, StatusCode::CONTINUE));
+        // Everything else decodes normally.
+        assert!(!response_has_no_body(get, StatusCode::OK));
+        assert!(!response_has_no_body(unknown_caller, StatusCode::OK));
+        assert!(!response_has_no_body(get, StatusCode::NOT_FOUND));
+        assert!(!response_has_no_body(
+            unknown_caller,
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 
     #[test]

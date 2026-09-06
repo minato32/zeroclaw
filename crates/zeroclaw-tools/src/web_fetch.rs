@@ -123,13 +123,15 @@ impl WebFetchTool {
     /// whether a budget cut it short. The caller marks truncation after any
     /// HTML-to-text conversion, so the marker never runs through the converter
     /// and a body the decoder stopped early is still marked even when the
-    /// converted text ends up under the cap.
+    /// converted text ends up under the cap. This tool only ever sends `GET`,
+    /// so no request-method bypass applies; the shared status-based bodyless
+    /// handling (e.g. `204 No Content`) still does.
     async fn read_response_text_limited(
         &self,
         response: reqwest::Response,
     ) -> anyhow::Result<(String, bool)> {
         let limit = (self.max_response_size != 0).then_some(self.max_response_size);
-        crate::http_decode::read_decoded_text(response, limit).await
+        crate::http_decode::read_decoded_text(response, limit, None).await
     }
 
     /// Build the standard-fetch client, wiring the redirect policy that keeps
@@ -1588,6 +1590,53 @@ mod tests {
         assert!(
             result.output.as_str().contains(payload),
             "the production client must negotiate and decode gzip: {}",
+            result.output.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_content_with_compression_metadata_returns_empty_body() {
+        // 204 No Content reaches the reader as a successful response with no
+        // body; compression metadata on it describes nothing. The shared
+        // status-based bodyless handling must yield an empty body instead of
+        // finalizing a decompressor over zero bytes.
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(204).insert_header("content-encoding", "gzip"))
+            .mount(&server)
+            .await;
+
+        let tool = WebFetchTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            vec!["*".into()],
+            vec![],
+            0,
+            30,
+            FirecrawlConfig::default(),
+            vec!["127.0.0.1".into()],
+            vec![],
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(serde_json::json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        assert!(
+            result.output.as_str().is_empty(),
+            "the body must be empty, got {:?}",
             result.output.as_str()
         );
     }

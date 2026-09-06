@@ -423,10 +423,17 @@ impl HttpRequestTool {
     /// response can decode into a much larger body, so the shared reader stops
     /// the decoder once the decoded output passes the cap instead of buffering
     /// the whole body first. A malformed compressed body surfaces as an error so
-    /// the caller can report a failed execution.
-    async fn read_response_text(&self, response: reqwest::Response) -> anyhow::Result<String> {
+    /// the caller can report a failed execution. The request method enables the
+    /// shared bodyless bypass (`HEAD` responses carry no body regardless of
+    /// what representation metadata advertises).
+    async fn read_response_text(
+        &self,
+        response: reqwest::Response,
+        method: reqwest::Method,
+    ) -> anyhow::Result<String> {
         let limit = (self.max_response_size != 0).then_some(self.max_response_size);
-        let (mut text, overflowed) = crate::http_decode::read_decoded_text(response, limit).await?;
+        let (mut text, overflowed) =
+            crate::http_decode::read_decoded_text(response, limit, Some(method)).await?;
         if overflowed {
             text.push_str("\n\n... [Response truncated due to size limit] ...");
         }
@@ -639,7 +646,7 @@ impl Tool for HttpRequestTool {
         }
 
         match self
-            .execute_request(&target, method, request_headers, body)
+            .execute_request(&target, method.clone(), request_headers, body)
             .await
         {
             Ok(response) => {
@@ -665,13 +672,14 @@ impl Tool for HttpRequestTool {
                 // decoder failure (e.g. a 2xx advertising gzip with malformed
                 // bytes) is an operational failure, not a successful execution,
                 // so track it separately from the HTTP status.
-                let (response_text, body_error) = match self.read_response_text(response).await {
-                    Ok(text) => (text, None),
-                    Err(e) => (
-                        format!("[Failed to read response body: {e}]"),
-                        Some(e.to_string()),
-                    ),
-                };
+                let (response_text, body_error) =
+                    match self.read_response_text(response, method).await {
+                        Ok(text) => (text, None),
+                        Err(e) => (
+                            format!("[Failed to read response body: {e}]"),
+                            Some(e.to_string()),
+                        ),
+                    };
 
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
@@ -876,7 +884,10 @@ mod tests {
         .unwrap();
         let response = chunked_response(&[b"hello", b" world", b" ignored"]).await;
 
-        let text = tool.read_response_text(response).await.unwrap();
+        let text = tool
+            .read_response_text(response, reqwest::Method::GET)
+            .await
+            .unwrap();
 
         assert!(text.starts_with("hello wo"));
         assert!(text.contains("[Response truncated due to size limit]"));
@@ -898,7 +909,9 @@ mod tests {
         let response = chunked_response(&[b"hello", b" world"]).await;
 
         assert_eq!(
-            tool.read_response_text(response).await.unwrap(),
+            tool.read_response_text(response, reqwest::Method::GET)
+                .await
+                .unwrap(),
             "hello world"
         );
     }
@@ -1301,6 +1314,196 @@ api_token = "Bearer from-secret"
         );
     }
 
+    #[tokio::test]
+    async fn head_response_with_content_encoding_returns_empty_body() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A HEAD response carries no body by HTTP semantics, whatever
+        // representation metadata the server advertises. Finalizing a gzip
+        // decoder over the zero bytes actually sent used to report a missing
+        // trailer and turn a correct empty response into a body-read failure.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-encoding", "gzip"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url, "method": "HEAD" }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        let output = result.output.as_str();
+        assert!(output.contains("Status: 200"), "got {output}");
+        assert!(
+            output.contains("content-encoding"),
+            "response headers must be preserved: {output}"
+        );
+        assert!(
+            output.ends_with("Response Body:\n"),
+            "the body must be empty, got {output:?}"
+        );
+        assert!(!output.contains("Failed to read response body"));
+    }
+
+    #[tokio::test]
+    async fn no_content_with_compression_metadata_returns_empty_body() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 204 No Content forbids a body, so compression metadata on it
+        // describes nothing. The status is still a 2xx success and the body is
+        // empty — not a decoder failure over zero bytes.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(204).insert_header("content-encoding", "gzip"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        let output = result.output.as_str();
+        assert!(output.contains("Status: 204"), "got {output}");
+        assert!(
+            output.ends_with("Response Body:\n"),
+            "the body must be empty, got {output:?}"
+        );
+        assert!(!output.contains("Failed to read response body"));
+    }
+
+    #[tokio::test]
+    async fn not_modified_keeps_status_disposition_without_body_error() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 304 Not Modified has no body and keeps its existing disposition:
+        // non-success (it is not a 2xx) with no error string. The defect made
+        // the gzip finalizer over zero bytes add a spurious body-read error on
+        // top; that must not return.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(304).insert_header("content-encoding", "gzip"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            !result.success,
+            "304 must keep its non-success HTTP-status disposition"
+        );
+        assert!(
+            result.error.is_none(),
+            "a bodyless 304 must not gain a body-read error: {:?}",
+            result.error
+        );
+        let output = result.output.as_str();
+        assert!(output.contains("Status: 304"), "got {output}");
+        assert!(
+            output.ends_with("Response Body:\n"),
+            "the body must be empty, got {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_get_200_compressed_body_still_fails() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The bodyless bypass is method/status-driven, never driven by an
+        // empty payload: an ordinary GET 200 advertising gzip that sends zero
+        // bytes is a truncated compressed stream and must keep failing the
+        // body read.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-encoding", "gzip"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            !result.success,
+            "a GET 200 with an empty compressed body must fail: {:?}",
+            result.error
+        );
+        let error = result.error.expect("the body read must report a failure");
+        assert!(
+            error.contains("Failed to read response body"),
+            "got {error:?}"
+        );
+    }
+
     #[test]
     fn extract_host_normalizes_ipv6_without_brackets() {
         let got = extract_host("https://[2001:db8::1]:443/path").unwrap();
@@ -1502,7 +1705,10 @@ api_token = "Bearer from-secret"
             .build()
             .expect("reqwest client");
         let response = client.get(&url).send().await.expect("request succeeds");
-        let text = tool.read_response_text(response).await.expect("body reads");
+        let text = tool
+            .read_response_text(response, reqwest::Method::GET)
+            .await
+            .expect("body reads");
 
         // The read stops at the 128-byte cap, nowhere near the 10 KiB decoded
         // body, and the over-limit marker is appended.
