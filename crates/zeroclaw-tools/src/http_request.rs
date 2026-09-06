@@ -1604,6 +1604,59 @@ api_token = "Bearer from-secret"
         );
     }
 
+    #[tokio::test]
+    async fn large_complete_deflate_response_decodes_exactly() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A valid deflate body larger than any internal verifier buffer must
+        // decode exactly under the configured cap; the completion check may
+        // not turn an ordinary under-cap response into a body-read failure.
+        let payload: String = (0..16_384)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "deflate")
+                    .set_body_raw(deflate_stream(payload.as_bytes()), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            65_536,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        let output = result.output.as_str();
+        assert!(
+            output.contains(payload.as_str()),
+            "the full body must decode exactly"
+        );
+        assert!(
+            !output.contains("[Response truncated due to size limit]"),
+            "an under-cap response is not truncated"
+        );
+    }
+
     #[test]
     fn extract_host_normalizes_ipv6_without_brackets() {
         let got = extract_host("https://[2001:db8::1]:443/path").unwrap();

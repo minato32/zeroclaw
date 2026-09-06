@@ -138,26 +138,28 @@ impl CompletionTrackedZlib {
         self.decoder.finish()
     }
 
-    /// The verification scratch output reproduces bytes the sink already
-    /// accepted, so it stays within the decoded-size class the caps already
-    /// bound. Each pass must consume input or produce output; one that cannot
-    /// reach `StreamEnd` leaves the stream incomplete or corrupt.
+    /// Drive the backend incrementally with `Flush::None` — the same contract
+    /// the primary decoder's own writer uses — over a fixed, reused buffer
+    /// whose output is discarded (the decoded content already lives in the
+    /// sink). The backend reports `StreamEnd` only when the terminal block
+    /// completes with the adler-32 verified and the dictionary drained; a
+    /// pass that consumes no input and produces no output, a needs-more-input
+    /// status, or corruption all mean the stream never completed. A one-shot
+    /// `Flush::Finish` call cannot replace this: on the pinned miniz backend
+    /// the first Finish uses a non-wrapping output buffer, fails regardless
+    /// when the whole remaining stream does not fit, and marks the stream
+    /// Failed so no retry can recover — valid bodies larger than the scratch
+    /// buffer would be rejected.
     fn stream_is_complete(offered: &[u8]) -> bool {
         let mut verify = flate2::Decompress::new(true);
-        let mut scratch: Vec<u8> = Vec::new();
+        let mut discard = vec![0_u8; 8192];
+        let mut input = offered;
         loop {
-            if scratch.len() == scratch.capacity() {
-                scratch.reserve(8192);
-            }
             let (before_in, before_out) = (verify.total_in(), verify.total_out());
-            let consumed = verify.total_in() as usize;
-            match verify.decompress_vec(
-                &offered[consumed..],
-                &mut scratch,
-                flate2::FlushDecompress::Finish,
-            ) {
+            match verify.decompress(input, &mut discard, flate2::FlushDecompress::None) {
                 Ok(flate2::Status::StreamEnd) => return true,
                 Ok(flate2::Status::Ok) => {
+                    input = &input[(verify.total_in() - before_in) as usize..];
                     if verify.total_in() == before_in && verify.total_out() == before_out {
                         return false;
                     }
@@ -729,5 +731,45 @@ mod tests {
         let (bytes, truncated, _) = decode_chunks(&["deflate"], Some(1024), &[&stream]).unwrap();
         assert!(bytes.is_empty(), "the stream encodes nothing");
         assert!(!truncated, "a complete stream is not truncation");
+    }
+
+    #[test]
+    fn large_complete_deflate_bodies_decode_exactly() {
+        // The completion verdict must not depend on any internal buffer
+        // boundary: complete zlib bodies straddling the verifier's scratch
+        // size decode exactly under the cap, with no truncation and no
+        // malformed-stream error.
+        for size in [8_191_usize, 8_192, 8_193, 16_384] {
+            let payload: Vec<u8> = (0..size).map(|i| b'a' + (i % 26) as u8).collect();
+            let stream = zlib_member(&payload);
+            let (bytes, truncated, _) =
+                decode_chunks(&["deflate"], Some(65_536), &[&stream]).unwrap();
+            assert_eq!(bytes.len(), size, "decoded length for {size}");
+            assert_eq!(bytes, payload, "decoded content for {size}");
+            assert!(!truncated, "a complete body is not truncation ({size})");
+        }
+    }
+
+    #[test]
+    fn fragmented_large_deflate_body_decodes_exactly() {
+        // Transport chunking must not affect the completion verdict: the same
+        // 16 KiB body delivered in small chunks still decodes exactly.
+        let payload: Vec<u8> = (0..16_384).map(|i| b'a' + (i % 26) as u8).collect();
+        let stream = zlib_member(&payload);
+        let chunks: Vec<&[u8]> = stream.chunks(97).collect();
+        let (bytes, truncated, _) = decode_chunks(&["deflate"], Some(65_536), &chunks).unwrap();
+        assert_eq!(bytes, payload, "decoded content across fragmented chunks");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn large_complete_deflate_body_under_unlimited_mode_decodes_exactly() {
+        // Unlimited mode still runs the completion verdict; it must not
+        // reject a complete body because of an internal buffer boundary.
+        let payload: Vec<u8> = (0..16_384).map(|i| b'a' + (i % 26) as u8).collect();
+        let stream = zlib_member(&payload);
+        let (bytes, truncated, _) = decode_chunks(&["deflate"], None, &[&stream]).unwrap();
+        assert_eq!(bytes, payload, "decoded content under unlimited mode");
+        assert!(!truncated);
     }
 }

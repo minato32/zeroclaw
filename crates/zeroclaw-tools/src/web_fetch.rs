@@ -1740,6 +1740,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_complete_deflate_response_decodes_exactly() {
+        // The second affected boundary: a valid under-cap deflate body larger
+        // than any internal verifier buffer decodes to exactly its content.
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let payload: String = (0..16_384)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "deflate")
+                    .set_body_raw(deflate_bytes(payload.as_bytes()), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = WebFetchTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            vec!["*".into()],
+            vec![],
+            65_536,
+            30,
+            FirecrawlConfig::default(),
+            vec!["127.0.0.1".into()],
+            vec![],
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(serde_json::json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        assert_eq!(
+            result.output.as_str(),
+            payload,
+            "the body must decode exactly, with no truncation marker"
+        );
+    }
+
+    #[tokio::test]
     async fn standard_fetch_decodes_every_gzip_member() {
         // RFC 1952 allows a gzip body to be a series of members. A single-member
         // decoder returns the first one and silently drops the rest, which reads
