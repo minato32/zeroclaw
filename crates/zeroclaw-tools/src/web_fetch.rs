@@ -1524,6 +1524,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_negotiates_and_decodes_through_the_production_client() {
+        // `Tool::execute` reads the process-global runtime proxy state, so hold
+        // the shared guard against the `proxy_config` writer tests.
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         use wiremock::matchers::{header_exists, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 

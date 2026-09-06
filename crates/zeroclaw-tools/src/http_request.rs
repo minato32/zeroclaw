@@ -1221,6 +1221,9 @@ api_token = "{encrypted}"
 
     #[tokio::test]
     async fn execute_sends_auth_secret_as_authorization_header() {
+        // `Tool::execute` reads the process-global runtime proxy state, so hold
+        // the shared guard against the `proxy_config` writer tests.
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
             Ok(l) => l,
             Err(_) => return, // IPv6 loopback is unavailable in this environment.
@@ -1515,6 +1518,7 @@ api_token = "Bearer from-secret"
 
     #[tokio::test]
     async fn decodes_every_gzip_member() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1573,6 +1577,7 @@ api_token = "Bearer from-secret"
 
     #[tokio::test]
     async fn repeated_content_encoding_lines_are_refused() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1620,6 +1625,7 @@ api_token = "Bearer from-secret"
 
     #[tokio::test]
     async fn malformed_compressed_2xx_reports_failure() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1671,6 +1677,7 @@ api_token = "Bearer from-secret"
 
     #[tokio::test]
     async fn request_advertises_accept_encoding() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         use wiremock::matchers::{header_exists, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1710,6 +1717,7 @@ api_token = "Bearer from-secret"
 
     #[tokio::test]
     async fn compound_content_encoding_reports_failure() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2291,6 +2299,7 @@ api_token = "Bearer from-secret"
 
     #[tokio::test]
     async fn ipv6_end_to_end_real_request_over_loopback() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
             Ok(l) => l,
             Err(_) => return, // IPv6 not available in this environment
