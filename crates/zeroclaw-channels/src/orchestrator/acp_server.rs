@@ -52,6 +52,13 @@ const CANCELLATION_EVENT_TOOL_ARGS: &str = "{}";
 /// re-enter the next provider request.
 const FAILURE_TURN_SENTINEL: &str = "zeroclaw.acp.turn-failed.v1";
 
+/// One provider-seed row paired with the index of the stored client row it
+/// came from. The single derived view `session/load` uses to align client
+/// replay with the retained provider boundary: cancellation filtering,
+/// unmatched-call repair, and whole-turn trimming all drop or reshape seed
+/// rows, so replay follows the provenance instead of a scalar position.
+type SeededMessage = (ConversationMessage, usize);
+
 /// Terminal result of a `session/prompt` turn, returned by the per-session turn
 /// task after it has already persisted the outcome's transcript while holding
 /// the session lock. The outer handler only needs to render the client-facing
@@ -1146,9 +1153,13 @@ impl AcpServer {
         // Repair an interrupted native-tool exchange left by a failed/cancelled
         // turn and drop the replay-only cancellation sentinel before seeding, on
         // the same typed-restore path `session/resume` uses. `stored_messages`
-        // retains the repaired transcript (incl. the sentinel) for client replay
-        // below; `seed_messages` is the sentinel-free provider history.
-        let (stored_messages, seed_messages, repaired_tool_calls) =
+        // retains the original transcript (incl. sentinels and unrepaired rows)
+        // for client replay below; `seed_pairs` is the single derived provider
+        // view — every seed row carries the stored index it came from — so the
+        // retained provider boundary maps back onto client replay after
+        // cancellation filtering, unmatched-call repair, and trimming reshape
+        // the seed.
+        let (stored_messages, seed_pairs, repaired_tool_calls) =
             Self::sanitize_restored_history(data.messages);
         if repaired_tool_calls > 0 {
             ::zeroclaw_log::record!(
@@ -1163,6 +1174,10 @@ impl AcpServer {
                 "ACP session/load repaired interrupted tool calls in restored transcript"
             );
         }
+        let seed_messages: Vec<ConversationMessage> = seed_pairs
+            .iter()
+            .map(|(message, _)| message.clone())
+            .collect();
         let restore_trim_event = agent.seed_conversation_history_with_event(seed_messages);
         let dropped_messages = match &restore_trim_event {
             Some(TurnEvent::HistoryTrimmed {
@@ -1170,6 +1185,14 @@ impl AcpServer {
             }) => *dropped_messages,
             _ => 0,
         };
+        // Whole-turn trimming drops a prefix of the provider seed. Map that
+        // boundary back to the original stored index so client replay starts
+        // at the same retained turn even though repair may have removed seed
+        // rows the stored transcript still contains.
+        let replay_from = seed_pairs
+            .get(dropped_messages)
+            .map(|(_, original_index)| *original_index)
+            .unwrap_or(stored_messages.len());
 
         let acp_channel = Arc::new(AcpChannel::new(
             "acp",
@@ -1215,20 +1238,18 @@ impl AcpServer {
             self.write_notification(&notification).await;
         }
 
-        // Replay exactly the history retained by the agent. Replaying the
-        // stored pre-trim rows would make the client display context that the
-        // restored agent has already discarded. Cancellation events are not
-        // part of the seeded set, so they don't count against the trim; one that
-        // falls inside the dropped prefix is dropped from replay too, and each
-        // surviving one replays as the live client-cancel update rather than a
-        // verbatim assistant message.
+        // Replay exactly the stored rows the retained provider seed still
+        // covers. Replaying the stored pre-trim rows would make the client
+        // display context the restored agent has already discarded, and
+        // skipping a scalar count of stored rows would drift from the seed
+        // once unmatched-call repair removes rows the transcript keeps.
+        // Cancellation events are not part of the seeded set, so they never
+        // move the boundary; one that belongs to a dropped turn is dropped
+        // from replay too, and each surviving one replays as the live
+        // client-cancel update rather than a verbatim assistant message.
         let mut replayed_messages = 0;
-        let mut seed_prefix_to_skip = dropped_messages;
-        for msg in &stored_messages {
-            if seed_prefix_to_skip > 0 {
-                if !Self::is_cancellation_event(msg) {
-                    seed_prefix_to_skip -= 1;
-                }
+        for (original_index, msg) in stored_messages.iter().enumerate() {
+            if original_index < replay_from {
                 continue;
             }
             replayed_messages += 1;
@@ -1398,8 +1419,12 @@ impl AcpServer {
         // interrupted native-tool exchange and drop the replay-only cancellation
         // sentinel, otherwise the next native-provider prompt would receive the
         // unmatched tool call / re-entered cancellation the repair prevents.
-        let (_stored_messages, seed_messages, repaired_tool_calls) =
+        let (_stored_messages, seed_pairs, repaired_tool_calls) =
             Self::sanitize_restored_history(data.messages);
+        let seed_messages: Vec<ConversationMessage> = seed_pairs
+            .iter()
+            .map(|(message, _)| message.clone())
+            .collect();
         if repaired_tool_calls > 0 {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2213,9 +2238,9 @@ impl AcpServer {
     /// localized `[turn failed]` marker, exactly as it did when the boundary was
     /// persisted inline. The stored transcript keeps the sentinel; client
     /// replay projects it separately (`history_notifications_for_message`).
-    fn project_failure_sentinels(seed: &mut [ConversationMessage]) {
+    fn project_failure_sentinels(seed: &mut [SeededMessage]) {
         let localized = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
-        for message in seed {
+        for (message, _) in seed {
             if Self::is_failure_sentinel(message) {
                 *message = ConversationMessage::Chat(ChatMessage::assistant(localized.clone()));
             }
@@ -2310,7 +2335,7 @@ impl AcpServer {
     /// repaired assistant tool-call messages for logging.
     fn sanitize_restored_history(
         messages: Vec<ConversationMessage>,
-    ) -> (Vec<ConversationMessage>, Vec<ConversationMessage>, usize) {
+    ) -> (Vec<ConversationMessage>, Vec<SeededMessage>, usize) {
         let stored: Vec<ConversationMessage> = messages
             .into_iter()
             .filter(|message| {
@@ -2322,10 +2347,14 @@ impl AcpServer {
         // provider rejected both stay visible: that activity happened, and the
         // durable transcript is expected to survive reload. `seed` is what the
         // next provider request is built from, so it is the only one repaired.
-        let mut seed: Vec<ConversationMessage> = stored
+        // Every seed row carries the stored index it came from, so the
+        // retained provider boundary maps back onto client replay after
+        // repair and trimming have reshaped the seed.
+        let mut seed: Vec<SeededMessage> = stored
             .iter()
-            .filter(|message| !Self::is_cancellation_event(message))
-            .cloned()
+            .enumerate()
+            .filter(|(_, message)| !Self::is_cancellation_event(message))
+            .map(|(original_index, message)| (message.clone(), original_index))
             .collect();
         let repaired = Self::repair_incomplete_tool_calls(&mut seed);
         Self::degrade_failed_turn_media(&mut seed);
@@ -2356,22 +2385,24 @@ impl AcpServer {
     /// transcript still replays the image to the client. Each sentinel is then
     /// projected to its localized marker by `project_failure_sentinels` before
     /// the seed reaches the agent.
-    fn degrade_failed_turn_media(seed: &mut [ConversationMessage]) {
+    fn degrade_failed_turn_media(seed: &mut [SeededMessage]) {
         let is_turn_opening = zeroclaw_runtime::agent::is_turn_opening_user_message;
 
         let failure_marks: Vec<usize> = seed
             .iter()
             .enumerate()
-            .filter(|(_, message)| Self::is_failure_sentinel(message))
+            .filter(|(_, (message, _))| Self::is_failure_sentinel(message))
             .map(|(index, _)| index)
             .collect();
 
         for end in failure_marks {
             let start = seed[..end]
                 .iter()
-                .rposition(is_turn_opening)
+                .rposition(|(message, _)| is_turn_opening(message))
                 .unwrap_or_default();
-            zeroclaw_runtime::agent::degrade_media_in_messages(&mut seed[start..end]);
+            for (message, _) in &mut seed[start..end] {
+                zeroclaw_runtime::agent::degrade_media_in_message(message);
+            }
         }
     }
 
@@ -2390,10 +2421,10 @@ impl AcpServer {
     /// assistant message. Orphaned `ToolResults` (a result whose call was
     /// dropped) are intentionally left to the provider adapters and
     /// `remove_orphaned_tool_messages`, which keep their id-recovery contracts.
-    fn repair_incomplete_tool_calls(messages: &mut Vec<ConversationMessage>) -> usize {
+    fn repair_incomplete_tool_calls(messages: &mut Vec<SeededMessage>) -> usize {
         let resolved: std::collections::HashSet<String> = messages
             .iter()
-            .filter_map(|message| match message {
+            .filter_map(|(message, _)| match message {
                 ConversationMessage::ToolResults(results) => Some(results),
                 _ => None,
             })
@@ -2403,7 +2434,7 @@ impl AcpServer {
         let mut repaired = 0usize;
         let mut i = 0;
         while i < messages.len() {
-            if Self::is_cancellation_event(&messages[i]) {
+            if Self::is_cancellation_event(&messages[i].0) {
                 // The structured cancellation sentinel is intentionally an
                 // unpaired call; it is replay-only and excluded from provider
                 // history elsewhere, so leave it intact here.
@@ -2412,7 +2443,7 @@ impl AcpServer {
             }
             let ConversationMessage::AssistantToolCalls {
                 text, tool_calls, ..
-            } = &mut messages[i]
+            } = &mut messages[i].0
             else {
                 i += 1;
                 continue;
@@ -2437,7 +2468,7 @@ impl AcpServer {
                 .map(ToString::to_string);
             match salvaged {
                 Some(text) => {
-                    messages[i] = ConversationMessage::Chat(ChatMessage::assistant(text));
+                    messages[i].0 = ConversationMessage::Chat(ChatMessage::assistant(text));
                     i += 1;
                 }
                 None => {
@@ -6396,71 +6427,81 @@ mod tests {
             }
         }
 
-        // Paired call + its result: left untouched.
+        fn seed_row(message: ConversationMessage) -> SeededMessage {
+            (message, 0)
+        }
+
+        // Paired call + its result: left untouched, provenance kept.
         let mut paired = vec![
-            ConversationMessage::AssistantToolCalls {
+            seed_row(ConversationMessage::AssistantToolCalls {
                 text: None,
                 tool_calls: vec![call("toolu_ok")],
                 reasoning_content: None,
-            },
-            ConversationMessage::ToolResults(vec![ToolResultMessage {
+            }),
+            seed_row(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "toolu_ok".to_string(),
                 content: "done".to_string(),
                 tool_name: "shell".to_string(),
-            }]),
+            }])),
         ];
         assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut paired), 0);
         assert_eq!(paired.len(), 2);
+        assert_eq!(paired[0].1, 0);
 
         // Partial: keep the paired call, drop the unpaired one.
-        let mut partial = vec![
-            ConversationMessage::AssistantToolCalls {
-                text: Some("working".to_string()),
-                tool_calls: vec![call("toolu_ok"), call("toolu_orphan")],
-                reasoning_content: None,
-            },
-            ConversationMessage::ToolResults(vec![ToolResultMessage {
+        let mut partial = vec![seed_row(ConversationMessage::AssistantToolCalls {
+            text: Some("working".to_string()),
+            tool_calls: vec![call("toolu_ok"), call("toolu_orphan")],
+            reasoning_content: None,
+        })];
+        partial.push(seed_row(ConversationMessage::ToolResults(vec![
+            ToolResultMessage {
                 tool_call_id: "toolu_ok".to_string(),
                 content: "done".to_string(),
                 tool_name: "shell".to_string(),
-            }]),
-        ];
+            },
+        ])));
         assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut partial), 1);
-        match &partial[0] {
+        match &partial[0].0 {
             ConversationMessage::AssistantToolCalls { tool_calls, .. } => {
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0].id, "toolu_ok");
             }
             other => panic!("expected surviving paired call, got {other:?}"),
         }
+        assert_eq!(partial[0].1, 0);
 
-        // Fully unpaired with salvageable text: becomes a plain assistant message.
-        let mut salvage = vec![ConversationMessage::AssistantToolCalls {
+        // Fully unpaired with salvageable text: becomes a plain assistant
+        // message in the same provenance row.
+        let mut salvage = vec![seed_row(ConversationMessage::AssistantToolCalls {
             text: Some("let me check".to_string()),
             tool_calls: vec![call("toolu_orphan")],
             reasoning_content: None,
-        }];
+        })];
         assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut salvage), 1);
-        match &salvage[0] {
+        match &salvage[0].0 {
             ConversationMessage::Chat(chat) => {
                 assert_eq!(chat.role, "assistant");
                 assert_eq!(chat.content, "let me check");
             }
             other => panic!("expected salvaged assistant text, got {other:?}"),
         }
+        assert_eq!(salvage[0].1, 0);
 
-        // Fully unpaired with no text: message dropped entirely.
+        // Fully unpaired with no text: message dropped entirely, and the
+        // unrelated provenance row around it keeps its original index.
         let mut dropped = vec![
-            ConversationMessage::Chat(ChatMessage::user("q")),
-            ConversationMessage::AssistantToolCalls {
+            seed_row(ConversationMessage::Chat(ChatMessage::user("q"))),
+            seed_row(ConversationMessage::AssistantToolCalls {
                 text: None,
                 tool_calls: vec![call("toolu_orphan")],
                 reasoning_content: None,
-            },
+            }),
         ];
         assert_eq!(AcpServer::repair_incomplete_tool_calls(&mut dropped), 1);
         assert_eq!(dropped.len(), 1);
-        assert!(matches!(&dropped[0], ConversationMessage::Chat(c) if c.role == "user"));
+        assert!(matches!(&dropped[0].0, ConversationMessage::Chat(c) if c.role == "user"));
+        assert_eq!(dropped[0].1, 0);
     }
 
     #[tokio::test]
@@ -7749,6 +7790,153 @@ mod tests {
                 .any(|message| message.content.contains(&omitted)),
             "the live seed should say an attachment was dropped: {:?}",
             live_requests[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_load_aligns_replay_with_repaired_trimmed_seed() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
+
+        // The C1 witness, composed: an older failed turn (user prompt,
+        // unmatched native call, durable failure sentinel) followed by a newer
+        // complete turn, restored under a history cap that retains only the
+        // newer turn. Repair removes the unmatched call from the provider
+        // seed, so the seed and the stored transcript stop sharing row
+        // positions; replay must follow the seed's retained boundary back to
+        // the original stored row instead of skipping a scalar count of stored
+        // rows — which would replay the older failure sentinel and drift from
+        // the provider's retained history.
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-trim-repair-alignment";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &AcpServer::failed_turn_transcript(vec![
+                    ConversationMessage::Chat(ChatMessage::user("older prompt before the failure")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "toolu_orphan_trim".to_string(),
+                            name: "shell".to_string(),
+                            arguments: "{}".to_string(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                ]),
+            )
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("newer complete question")),
+                    ConversationMessage::Chat(ChatMessage::assistant("newer complete answer")),
+                ],
+            )
+            .unwrap();
+
+        // The cap retains only the newer turn: after repair the seed body is
+        // [older user, older failure sentinel, newer user, newer assistant],
+        // and trimming drops the first two rows.
+        let mut config = make_test_config(cwd.path());
+        config
+            .runtime_profiles
+            .get_mut("default")
+            .unwrap()
+            .max_history_messages = Some(2);
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("session/load must succeed");
+
+        let mut notifications = Vec::new();
+        while let Ok(message) = writer_rx.try_recv() {
+            notifications.push(serde_json::from_str::<serde_json::Value>(&message).unwrap());
+        }
+        let old_sentinel = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
+        let replayed_text = |notifications: &[serde_json::Value]| {
+            notifications
+                .iter()
+                .filter_map(|n| {
+                    n["params"]["update"]["content"]["text"]
+                        .as_str()
+                        .map(ToString::to_string)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let replayed = replayed_text(&notifications);
+        assert!(
+            replayed.contains("newer complete question")
+                && replayed.contains("newer complete answer"),
+            "client replay must start at the retained newer turn: {replayed:?}"
+        );
+        assert!(
+            !replayed.contains("older prompt before the failure")
+                && !replayed.contains(&old_sentinel),
+            "client replay must not resurrect the trimmed older failed turn: {replayed:?}"
+        );
+        assert!(
+            !replayed.contains("toolu_orphan_trim"),
+            "the unmatched call's turn was trimmed; its rows are not replayed: {replayed:?}"
+        );
+
+        // The provider seed contains exactly the retained safe turn.
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .expect("loaded session must be active");
+        session
+            .lock()
+            .await
+            .agent
+            .set_model_provider(Box::new(RecordingNativeProvider {
+                requests: Arc::clone(&requests),
+            }));
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": "continue from the retained turn" }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly one provider request");
+        let seed_text = requests[0]
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            seed_text.contains("newer complete question")
+                && seed_text.contains("newer complete answer"),
+            "the provider seed must retain the safe newer turn: {seed_text:?}"
+        );
+        assert!(
+            !seed_text.contains("older prompt before the failure")
+                && !seed_text.contains(&old_sentinel)
+                && !seed_text.contains("toolu_orphan_trim"),
+            "the provider seed must exclude the repaired, trimmed older turn: {seed_text:?}"
         );
     }
 

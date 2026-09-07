@@ -23,6 +23,29 @@ pub fn is_turn_opening_user_message(message: &ConversationMessage) -> bool {
     )
 }
 
+/// Replace image references in a single message with an omission note.
+///
+/// The per-message form of [`degrade_media_in_messages`]: callers that carry
+/// their own span bookkeeping (for example a provenance-preserving projection
+/// of seed rows) apply it row by row, while span-shaped callers keep using the
+/// slice form. Returns the number of image references degraded.
+pub fn degrade_media_in_message(message: &mut ConversationMessage) -> usize {
+    let omitted = crate::i18n::get_required_cli_string("turn-failed-attachment-omitted");
+    let ConversationMessage::Chat(chat) = message else {
+        return 0;
+    };
+    let (cleaned, refs) = multimodal::parse_image_markers(&chat.content);
+    if refs.is_empty() {
+        return 0;
+    }
+    chat.content = if cleaned.is_empty() {
+        omitted
+    } else {
+        format!("{cleaned}\n\n{omitted}")
+    };
+    refs.len()
+}
+
 /// Replace image references in this message span with an omission note.
 ///
 /// A turn that ended in a non-retryable failure may have had its attachments
@@ -36,22 +59,5 @@ pub fn is_turn_opening_user_message(message: &ConversationMessage) -> bool {
 /// policy (which messages belong to the failed turn); this helper only
 /// performs the projection.
 pub fn degrade_media_in_messages(messages: &mut [ConversationMessage]) -> usize {
-    let omitted = crate::i18n::get_required_cli_string("turn-failed-attachment-omitted");
-    let mut degraded = 0;
-    for message in messages {
-        let ConversationMessage::Chat(chat) = message else {
-            continue;
-        };
-        let (cleaned, refs) = multimodal::parse_image_markers(&chat.content);
-        if refs.is_empty() {
-            continue;
-        }
-        degraded += refs.len();
-        chat.content = if cleaned.is_empty() {
-            omitted.clone()
-        } else {
-            format!("{cleaned}\n\n{omitted}")
-        };
-    }
-    degraded
+    messages.iter_mut().map(degrade_media_in_message).sum()
 }
