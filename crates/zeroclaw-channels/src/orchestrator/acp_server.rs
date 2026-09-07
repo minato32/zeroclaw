@@ -7639,8 +7639,9 @@ mod tests {
         std::fs::write(&live_image, file_bytes).unwrap();
         let live_marker = format!("look at this [IMAGE:{}]", live_image.display());
         let tool_call_response = format!(
-            "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": \"{}\"}}}}\n</tool_call>",
-            live_image.display()
+            "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": {}}}}}\n</tool_call>",
+            serde_json::to_string(&live_image.display().to_string())
+                .expect("a path string serializes to JSON")
         );
 
         let live_store = Arc::new(
