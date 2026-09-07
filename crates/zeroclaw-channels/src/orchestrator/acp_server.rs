@@ -7543,23 +7543,25 @@ mod tests {
             .await
             .expect("the next prompt must reach the provider");
 
-        let restore_requests = restore_requests.lock();
-        assert_eq!(restore_requests.len(), 1, "expected one provider request");
-        for message in &restore_requests[0] {
-            assert!(
-                !message.content.contains("data:image"),
-                "the restored seed must not re-attach the rejected image past the tool carrier: {message:?}"
-            );
-        }
         let omitted =
             zeroclaw_runtime::i18n::get_required_cli_string("turn-failed-attachment-omitted");
-        assert!(
-            restore_requests[0]
-                .iter()
-                .any(|message| message.content.contains(&omitted)),
-            "the restored seed should say an attachment was dropped: {:?}",
-            restore_requests[0]
-        );
+        {
+            let restore_requests = restore_requests.lock();
+            assert_eq!(restore_requests.len(), 1, "expected one provider request");
+            for message in &restore_requests[0] {
+                assert!(
+                    !message.content.contains("data:image"),
+                    "the restored seed must not re-attach the rejected image past the tool carrier: {message:?}"
+                );
+            }
+            assert!(
+                restore_requests[0]
+                    .iter()
+                    .any(|message| message.content.contains(&omitted)),
+                "the restored seed should say an attachment was dropped: {:?}",
+                restore_requests[0]
+            );
+        }
 
         // ── Phase B: live path through the real turn machinery ───────
         // The provider advertises vision (no marker stripping) but no native
