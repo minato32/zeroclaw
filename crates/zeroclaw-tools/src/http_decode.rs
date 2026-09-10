@@ -30,6 +30,17 @@ use crate::helpers::response_body::{BoundedBody, into_text};
 /// than by this.
 const COMPRESSED_INPUT_SLACK: usize = 64 * 1024;
 
+#[cfg(test)]
+pub(crate) fn empty_gzip_members_past_input_slack() -> (Vec<u8>, usize) {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(b"").unwrap();
+    let member = encoder.finish().unwrap();
+    let member_count = (COMPRESSED_INPUT_SLACK / member.len()) + 64;
+    let body = member.repeat(member_count);
+    let limit = body.len() - COMPRESSED_INPUT_SLACK;
+    (body, limit)
+}
+
 /// Marks the sink's refusal so a spent decoded budget is told apart from a
 /// genuinely malformed stream, wherever the decoder surfaces it.
 const CAP_REACHED: &str = "decoded response cap reached";
@@ -323,8 +334,8 @@ impl BoundedDecode {
         })
     }
 
-    /// Feed one chunk. Returns `false` once a budget is spent and no further
-    /// chunk should be read.
+    /// Feed one chunk. Returns `false` once a budget truncates the input and no
+    /// further chunk should be read.
     fn push(&mut self, chunk: &[u8]) -> io::Result<bool> {
         // A spent budget already ended the read; a repeated call must not feed
         // the decoder again.
@@ -336,16 +347,19 @@ impl BoundedDecode {
         // let one chunk overshoot the allowance by its full size, which is
         // exactly the unbounded low-yield decoder work this budget exists to
         // prevent.
-        let offered = match self.input_budget {
+        let (offered, clipped) = match self.input_budget {
             Some(budget) => {
                 let remaining = budget.saturating_sub(self.consumed);
                 if remaining == 0 {
                     self.stopped_early = true;
                     return Ok(false);
                 }
-                &chunk[..chunk.len().min(remaining)]
+                (
+                    &chunk[..chunk.len().min(remaining)],
+                    chunk.len() > remaining,
+                )
             }
-            None => chunk,
+            None => (chunk, false),
         };
         let written = self
             .decoder
@@ -363,11 +377,7 @@ impl BoundedDecode {
             self.stopped_early = true;
             return Ok(false);
         }
-        if self.decoder.is_full()
-            || self
-                .input_budget
-                .is_some_and(|budget| self.consumed >= budget)
-        {
+        if self.decoder.is_full() || clipped {
             self.stopped_early = true;
             return Ok(false);
         }
@@ -676,6 +686,22 @@ mod tests {
             "the payload member must never reach the decoder, got {:?}",
             String::from_utf8_lossy(&bytes)
         );
+    }
+
+    #[test]
+    fn complete_stream_ending_exactly_at_input_allowance_is_not_truncated() {
+        let (body, limit) = empty_gzip_members_past_input_slack();
+
+        for chunk_size in [body.len(), 97] {
+            let chunks: Vec<&[u8]> = body.chunks(chunk_size).collect();
+            let (bytes, truncated, _) = decode_chunks(&["gzip"], Some(limit), &chunks).unwrap();
+
+            assert!(bytes.is_empty(), "the complete stream decodes to nothing");
+            assert!(
+                !truncated,
+                "ordinary EOF exactly at the input allowance must finalize the decoder"
+            );
+        }
     }
 
     #[test]

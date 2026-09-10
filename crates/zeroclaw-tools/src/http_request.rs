@@ -1657,6 +1657,52 @@ api_token = "Bearer from-secret"
         );
     }
 
+    #[tokio::test]
+    async fn exact_input_allowance_response_is_not_reported_as_truncated() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (body, limit) = crate::http_decode::empty_gzip_members_past_input_slack();
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(body, "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            limit,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        assert!(
+            !result
+                .output
+                .as_str()
+                .contains("[Response truncated due to size limit]"),
+            "a complete exact-allowance response is not truncated"
+        );
+    }
+
     #[test]
     fn extract_host_normalizes_ipv6_without_brackets() {
         let got = extract_host("https://[2001:db8::1]:443/path").unwrap();

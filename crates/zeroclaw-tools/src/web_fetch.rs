@@ -1792,6 +1792,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_input_allowance_response_is_not_reported_as_truncated() {
+        let (body, limit) = crate::http_decode::empty_gzip_members_past_input_slack();
+        let result = fetch_encoded("gzip", body, limit).await;
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        assert!(result.output.as_str().is_empty(), "got {:?}", result.output);
+        assert!(
+            !result.output.as_str().contains("[Response truncated"),
+            "a complete exact-allowance response is not truncated"
+        );
+    }
+
+    #[tokio::test]
     async fn standard_fetch_decodes_every_gzip_member() {
         // RFC 1952 allows a gzip body to be a series of members. A single-member
         // decoder returns the first one and silently drops the rest, which reads
