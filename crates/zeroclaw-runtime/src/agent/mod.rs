@@ -26,7 +26,7 @@ pub(crate) mod turn;
 
 pub use turn::context::TurnMeta;
 pub use turn::{
-    is_semantic_empty_terminal_completion,
+    append_safeguard_fallback_notice, is_semantic_empty_terminal_completion,
     media_degrade::{
         degrade_media_in_message, degrade_media_in_messages, is_turn_opening_user_message,
     },
